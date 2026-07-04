@@ -1,4 +1,4 @@
-"""Train the migrated EarthFormer backbone on SEVIRI imagery."""
+"""Train EarthFormer + Perceiver readout for SEVIRI CSI forecasting."""
 
 from __future__ import annotations
 
@@ -21,11 +21,12 @@ if str(PREP_MODELS_ROOT) not in sys.path:
 
 from configs.config import TrainingConfig, build_arg_parser, config_from_args  # noqa: E402
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
-from models.model import build_training_model  # noqa: E402
+from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import resume_checkpoint, save_checkpoint  # noqa: E402
 from training.losses import MSELoss  # noqa: E402
-from training.validate import target_to_nthwc, validate  # noqa: E402
+from training.validate import ensure_forecast_target, validate  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
+from utils.plotting import save_training_plots  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
 
 
@@ -33,7 +34,7 @@ from utils.seed import seed_everything  # noqa: E402
 
 
 class EarthFormerTrainer:
-    """Coordinate EarthFormer backbone fine-tuning."""
+    """Coordinate EarthFormer + Perceiver CSI forecasting fine-tuning."""
 
     def __init__(self, config: TrainingConfig) -> None:
         self.config = config
@@ -56,7 +57,7 @@ class EarthFormerTrainer:
             shuffle=False,
         )
 
-        self.model = build_training_model(self.config).to(self.device)
+        self.model = build_perceiver_readout_model(self.config).to(self.device)
         self.criterion = MSELoss()
         self.optimizer = AdamW(
             self.model.parameters(),
@@ -77,6 +78,7 @@ class EarthFormerTrainer:
             # Older PyTorch versions may not accept init_scale kwarg.
             self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
         self.logger = CSVLogger(self.config.output_dir / self.config.log_filename)
+        self.history: list[dict[str, float]] = []
         self.start_epoch = 1
         self.best_loss = float("inf")
 
@@ -103,12 +105,20 @@ class EarthFormerTrainer:
 
         for batch in progress:
             inputs = batch["satellite"].to(self.device, non_blocking=True)
-            targets = target_to_nthwc(batch["target"]).to(self.device, non_blocking=True)
+            targets = ensure_forecast_target(batch["target"]).to(
+                self.device,
+                non_blocking=True,
+            )
             batch_size = inputs.shape[0]
 
             self.optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
                 predictions = self.model(inputs)
+                if predictions.shape != targets.shape:
+                    raise ValueError(
+                        "Prediction and target shapes differ: "
+                        f"{tuple(predictions.shape)} vs {tuple(targets.shape)}"
+                    )
                 loss = self.criterion(predictions, targets)
 
             self.scaler.scale(loss).backward()
@@ -160,27 +170,46 @@ class EarthFormerTrainer:
         for epoch in range(self.start_epoch, self.config.epochs + 1):
             epoch_start = time.perf_counter()
             train_loss = self.train_one_epoch(epoch)
-            validation_loss = validate(
+            validation_metrics = validate(
                 model=self.model,
                 dataloader=self.val_loader,
                 criterion=self.criterion,
                 device=self.device,
                 use_amp=self.use_amp,
             )
+            validation_loss = float(validation_metrics["val_loss"])
             self.scheduler.step()
             epoch_time = time.perf_counter() - epoch_start
             self.save_epoch_checkpoints(epoch, validation_loss)
-            self.logger.log(
+            row = {
+                "epoch": epoch,
+                "train_loss": float(train_loss),
+                "val_loss": validation_loss,
+                "CSI_MAE": float(validation_metrics["CSI_MAE"]),
+                "CSI_RMSE": float(validation_metrics["CSI_RMSE"]),
+                "CSI_nRMSE": float(validation_metrics["CSI_nRMSE"]),
+                "CSI_R2": float(validation_metrics["CSI_R2"]),
+                "GHI_MAE": float(validation_metrics["GHI_MAE"]),
+                "GHI_RMSE": float(validation_metrics["GHI_RMSE"]),
+                "GHI_nRMSE": float(validation_metrics["GHI_nRMSE"]),
+                "GHI_R2": float(validation_metrics["GHI_R2"]),
+                "learning_rate": float(self.current_lr()),
+                "epoch_time": float(epoch_time),
+            }
+            self.history.append(row)
+            self.logger.log(**row)
+            save_training_plots(
+                history=self.history,
+                sample=validation_metrics.get("sample"),
+                output_dir=self.config.output_dir,
                 epoch=epoch,
-                train_loss=train_loss,
-                validation_loss=validation_loss,
-                learning_rate=self.current_lr(),
-                epoch_time=epoch_time,
             )
             print(
                 f"Epoch {epoch:03d} | "
                 f"train={train_loss:.6f} | "
                 f"val={validation_loss:.6f} | "
+                f"CSI_RMSE={validation_metrics['CSI_RMSE']:.6f} | "
+                f"GHI_RMSE={validation_metrics['GHI_RMSE']:.6f} | "
                 f"lr={self.current_lr():.3e} | "
                 f"time={epoch_time:.1f}s"
             )
@@ -238,9 +267,7 @@ class EarthFormerTrainer:
         batch = next(iter(self.train_loader))
 
         inputs = batch["satellite"].to(self.device)
-        targets = target_to_nthwc(
-            batch["target"]
-        ).to(self.device)
+        targets = ensure_forecast_target(batch["target"]).to(self.device)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -278,13 +305,13 @@ class EarthFormerTrainer:
                 # Check prediction finite status
                 with torch.no_grad():
                     try:
-                        trace = self.model.forward_trace(inputs)
+                        trace = self.model(inputs, return_debug=True)
                     except Exception as e_trace:
-                        print("forward_trace failed:", e_trace)
+                        print("debug forward failed:", e_trace)
                         raise
 
                 # Print basic stats for traced tensors
-                for k, v in trace.get("trace", {}).items():
+                for k, v in trace.get("earthformer_trace", {}).items():
                     if isinstance(v, tuple):
                         print(f"trace {k}: shape={v}")
                     else:
@@ -303,7 +330,7 @@ class EarthFormerTrainer:
 
                 # Check init_global_vectors if present
                 try:
-                    core = getattr(self.model, "model", None)
+                    core = getattr(getattr(self.model, "earthformer", None), "model", None)
                     if core is not None and hasattr(core, "init_global_vectors"):
                         ig = core.init_global_vectors
                         print("init_global_vectors any nan:", torch.isnan(ig).any().item(), "any inf:", torch.isinf(ig).any().item())
@@ -383,9 +410,7 @@ class EarthFormerTrainer:
 
                 inputs = batch["satellite"].to(self.device)
 
-                targets = target_to_nthwc(
-                    batch["target"]
-                ).to(self.device)
+                targets = ensure_forecast_target(batch["target"]).to(self.device)
 
                 self.optimizer.zero_grad()
 
@@ -461,13 +486,14 @@ class EarthFormerTrainer:
 
             train = self.train_one_epoch(epoch)
 
-            val = validate(
+            val_metrics = validate(
                 model=self.model,
                 dataloader=self.val_loader,
                 criterion=self.criterion,
                 device=self.device,
                 use_amp=self.use_amp,
             )
+            val = float(val_metrics["val_loss"])
 
             self.scheduler.step()
 
@@ -479,7 +505,15 @@ class EarthFormerTrainer:
             self.logger.log(
                 epoch=epoch,
                 train_loss=train,
-                validation_loss=val,
+                val_loss=val,
+                CSI_MAE=float(val_metrics["CSI_MAE"]),
+                CSI_RMSE=float(val_metrics["CSI_RMSE"]),
+                CSI_nRMSE=float(val_metrics["CSI_nRMSE"]),
+                CSI_R2=float(val_metrics["CSI_R2"]),
+                GHI_MAE=float(val_metrics["GHI_MAE"]),
+                GHI_RMSE=float(val_metrics["GHI_RMSE"]),
+                GHI_nRMSE=float(val_metrics["GHI_nRMSE"]),
+                GHI_R2=float(val_metrics["GHI_R2"]),
                 learning_rate=self.current_lr(),
                 epoch_time=0.0,
             )

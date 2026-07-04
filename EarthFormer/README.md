@@ -1,14 +1,13 @@
-# EarthFormer SEVIRI Backbone Training
+# EarthFormer SEVIRI CSI Forecasting
 
 Research-grade PyTorch training scaffold for fine-tuning the official
-EarthFormer backbone on Meteosat SEVIRI image sequences, with an optional
-Perceiver IO output-query readout for CSI-stage architectural validation.
+EarthFormer backbone on Meteosat SEVIRI image sequences with a Perceiver IO
+output-query readout for next-day CSI forecasting.
 
-The original backbone training path still uses the official EarthFormer
-frame-forecasting output already validated in `earthformer_migration`. The new
-Perceiver readout path is separate: it replaces only the use of
-`dec_final_proj` after `pre_head_latent` and produces a CSI-shaped `(B,T)`
-sequence for architecture validation. It does not use auxiliary features.
+The current training path keeps the verified EarthFormer migration intact and
+uses the already-validated Perceiver readout after `pre_head_latent`. The model
+predicts only a 13-element CSI sequence. GHI is reconstructed externally as
+`CSI * clear_sky_ghi` during validation and inference.
 
 ## Project Structure
 
@@ -49,6 +48,7 @@ EarthFormer/
   utils/
     logger.py
     metrics.py
+    plotting.py
     seed.py
   outputs/
   checkpoints/
@@ -85,12 +85,14 @@ dualet_metadata.parquet
 Each sample uses:
 
 ```text
-satellite input: (T, 7, 200, 200), T <= 13
-temporary image target: (12, 1, 200, 200)
+satellite input: (13, 7, 200, 200)
+target CSI:      (13,)
+clear-sky GHI:   (13,)
 ```
 
-The target is a temporary one-channel SEVIRI image target used only to validate
-that the pretrained EarthFormer backbone can be optimized. It is not CSI.
+The dataset may also provide `target_ghi`; otherwise validation reconstructs
+ground-truth GHI from `target_csi * clear_sky_ghi`. Auxiliary features are not
+passed to the model.
 
 ## Installation
 
@@ -123,8 +125,9 @@ When `--dataset-root` is omitted, the config tries, in order:
 
 - `EARTHFORMER_DATASET_ROOT`
 - a single matching Kaggle dataset under `/kaggle/input`
-- local `data/`
+- Colab local SSD `/content/datasets`
 - Google Drive `/content/drive/MyDrive/EarthFormer/datasets`
+- local `data/`
 - local `../verification_datasets/BEST_7_3months`
 - local `../verification_datasets/BEST_7_full_year`
 
@@ -136,6 +139,8 @@ python training/train.py \
   --batch-size 2 \
   --learning-rate 1e-4 \
   --epochs 20 \
+  --input-length 13 \
+  --output-length 13 \
   --num-workers 2 \
   --device auto
 ```
@@ -149,7 +154,8 @@ The training loop includes:
 - gradient clipping
 - validation every epoch
 - `tqdm` progress bar
-- CSV logging
+- CSV logging with CSI and reconstructed-GHI metrics
+- automatic training/validation plots under `outputs/plots/`
 - latest and best checkpoint saving
 
 ## Perceiver IO Readout Validation
@@ -185,7 +191,7 @@ Configurable readout options:
 
 ```bash
 --query-dimension 64
---num-output-queries 12
+--num-output-queries 13
 --num-attention-heads 4
 --readout-dropout 0.1
 --regression-hidden-dim 32
@@ -214,9 +220,9 @@ Run the full suite in Colab:
 
 ```bash
 python EarthFormer/scripts/run_sanity_suite.py \
-  --dataset-root /content/drive/MyDrive/EarthFormer/datasets \
-  --checkpoint-dir /content/drive/MyDrive/EarthFormer/checkpoints \
-  --output-dir /content/drive/MyDrive/EarthFormer/outputs \
+  --dataset-root /content/datasets \
+  --checkpoint-dir /content/checkpoints \
+  --output-dir /content/outputs \
   --batch-size 1 \
   --num-workers 2 \
   --device auto
@@ -225,12 +231,12 @@ python EarthFormer/scripts/run_sanity_suite.py \
 Individual checks:
 
 ```bash
-python EarthFormer/scripts/verify_perceiver_pipeline.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
-python EarthFormer/scripts/inspect_perceiver.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
-python EarthFormer/scripts/check_attention.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
-python EarthFormer/scripts/test_one_batch.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
-python EarthFormer/scripts/test_overfit.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets --samples 8 --max-epochs 50
-python EarthFormer/scripts/test_resume.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+python EarthFormer/scripts/verify_perceiver_pipeline.py --dataset-root /content/datasets
+python EarthFormer/scripts/inspect_perceiver.py --dataset-root /content/datasets
+python EarthFormer/scripts/check_attention.py --dataset-root /content/datasets
+python EarthFormer/scripts/test_one_batch.py --dataset-root /content/datasets
+python EarthFormer/scripts/test_overfit.py --dataset-root /content/datasets --samples 8 --max-epochs 50
+python EarthFormer/scripts/test_resume.py --dataset-root /content/datasets
 ```
 
 All diagnostic outputs are written to:
@@ -272,8 +278,8 @@ Each checkpoint contains:
 
 ## Validation
 
-Validation is called automatically after every epoch. The validation function
-returns only average MSE loss.
+Validation is called automatically after every epoch. It reports MSE loss plus
+MAE, RMSE, nRMSE, and R2 for both CSI and reconstructed GHI.
 
 ## Inference
 
@@ -292,7 +298,10 @@ outputs/inference_sample.pt
 
 with:
 
-- official prediction tensor
+- CSI prediction tensor
+- reconstructed GHI prediction tensor
+- optional CSI/GHI target tensors
+- clear-sky GHI tensor
 - pre-head latent tensor
 - sample metadata
 
@@ -332,5 +341,6 @@ python training/train.py
 - Type hints and docstrings.
 - No notebook-specific code.
 - No hardcoded Windows paths.
-- No auxiliary features, latitude, longitude, solar elevation, clear-sky GHI,
-  or feature fusion at this stage.
+- No auxiliary feature conditioning, latitude, longitude, solar elevation, or
+  feature fusion at this stage. Clear-sky GHI is used only after prediction for
+  external GHI reconstruction.

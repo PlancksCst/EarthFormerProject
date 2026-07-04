@@ -5,3 +5,4 @@ pyarrow
 zarr
 einops
 tqdm
+matplotlib

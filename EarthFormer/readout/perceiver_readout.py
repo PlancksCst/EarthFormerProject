@@ -27,7 +27,7 @@ class PerceiverReadout(nn.Module):
         self,
         latent_dim: int = 16,
         query_dim: int = 64,
-        num_queries: int = 12,
+        num_queries: int = 13,
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         regression_hidden_dim: int = 32,

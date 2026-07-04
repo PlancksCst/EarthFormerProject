@@ -82,7 +82,7 @@ With the default config:
 
 ```text
 query_dimension = 64
-num_output_queries = 12
+num_output_queries = 13
 num_attention_heads = 4
 readout_dropout = 0.1
 regression_hidden_dim = 32
@@ -92,7 +92,7 @@ The verifier reports:
 
 ```text
 EarthFormer parameters: 8,652,525
-Perceiver readout parameters: 13,537
+Perceiver readout parameters: 13,601
 ```
 
 This preserves transfer learning: the pretrained EarthFormer parameters are
@@ -113,12 +113,12 @@ python -m EarthFormer.scripts.verify_perceiver_readout \
 Successful validation should report:
 
 ```text
-pre_head_latent:    [1, 12, 200, 200, 16]
-flattened_tokens:  [1, 12, 40000, 16]
-queries:           [1, 12, 64]
-attention_output:  [1, 12, 64]
-regression_output: [1, 12]
-prediction:        [1, 12]
+pre_head_latent:    [1, 13, 200, 200, 16]
+flattened_tokens:  [1, 13, 40000, 16]
+queries:           [1, 13, 64]
+attention_output:  [1, 13, 64]
+regression_output: [1, 13]
+prediction:        [1, 13]
 earthformer_grad_ok: true
 readout_grad_ok: true
 checkpoint_roundtrip.strict: true

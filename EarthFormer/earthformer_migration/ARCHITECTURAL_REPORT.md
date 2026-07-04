@@ -146,12 +146,12 @@ Adapted SEVIRI decoder flow:
 
 | Stage | Shape |
 | --- | --- |
-| Initial decoder query | `(B, 12, 9, 9, 256)` |
-| After Cuboid decoder | `(B, 12, 17, 17, 128)` |
-| Final upsampling stage 0 | `(B, 12, 34, 34, 128)` |
-| Final upsampling stage 1 | `(B, 12, 67, 67, 64)` |
-| Final upsampling stage 2 | `(B, 12, 200, 200, 16)` |
-| Official projection output | `(B, 12, 200, 200, 1)` |
+| Initial decoder query | `(B, 13, 9, 9, 256)` |
+| After Cuboid decoder | `(B, 13, 17, 17, 128)` |
+| Final upsampling stage 0 | `(B, 13, 34, 34, 128)` |
+| Final upsampling stage 1 | `(B, 13, 67, 67, 64)` |
+| Final upsampling stage 2 | `(B, 13, 200, 200, 16)` |
+| Official projection output | `(B, 13, 200, 200, 1)` |
 
 ## Prediction Head Boundary
 
@@ -165,7 +165,7 @@ The latent tensor immediately before it is:
 
 ```text
 pre_head_latent = final_decoder(decoder_output)
-shape = (B, 12, 200, 200, 16)
+shape = (B, 13, 200, 200, 16)
 ```
 
 The migration wrapper exposes this tensor through:
@@ -229,12 +229,14 @@ It returns only:
 
 ```text
 satellite: (T, 7, 200, 200)
+target CSI: (13,)
+clear-sky GHI: (13,)
 image_mask
 metadata strings
 ```
 
-It intentionally does not return CSI, GHI, clear-sky GHI, solar elevation,
-latitude, longitude, or cyclical time encodings.
+It intentionally does not return auxiliary conditioning features such as solar
+elevation, latitude, longitude, or cyclical time encodings to the model.
 
 ## Checkpoint Loading Result
 
@@ -266,10 +268,10 @@ Forward trace on local sample `sample_id=0`, location `LBRAS`:
 | After initial encoder | `(1, 13, 17, 17, 128)` |
 | Encoder memory 0 | `(1, 13, 17, 17, 128)` |
 | Encoder memory 1 | `(1, 13, 9, 9, 256)` |
-| Initial decoder query | `(1, 12, 9, 9, 256)` |
-| After Cuboid decoder | `(1, 12, 17, 17, 128)` |
-| Pre-head latent | `(1, 12, 200, 200, 16)` |
-| Official prediction | `(1, 12, 200, 200, 1)` |
+| Initial decoder query | `(1, 13, 9, 9, 256)` |
+| After Cuboid decoder | `(1, 13, 17, 17, 128)` |
+| Pre-head latent | `(1, 13, 200, 200, 16)` |
+| Official prediction | `(1, 13, 200, 200, 1)` |
 
 ## Faithfulness Assessment
 
@@ -289,7 +291,7 @@ Preserved unchanged:
 Changed only for compatibility:
 
 - Model input shape changed to `(13, 200, 200, 7)`.
-- Model target spatial shape changed to `(12, 200, 200, 1)` so the official
+- Model target spatial shape changed to `(13, 200, 200, 1)` so the official
   SEVIR projection head remains one-channel.
 - First input convolution initialized from the pretrained single-channel
   filters.

@@ -40,6 +40,7 @@ def discover_dataset_root() -> Path:
 
     root = project_root()
     candidates = [
+        Path("/content/datasets"),
         Path("/content/drive/MyDrive/EarthFormer/datasets"),
         root / "data",
         root.parent / "data",
@@ -58,6 +59,26 @@ def discover_dataset_root() -> Path:
     return root / "data"
 
 
+def discover_checkpoint_dir() -> Path:
+    """Discover a portable checkpoint directory."""
+    env_value = os.environ.get("EARTHFORMER_CHECKPOINT_DIR")
+    if env_value:
+        return Path(env_value)
+    if Path("/content/datasets").exists() or Path("/content").exists():
+        return Path("/content/checkpoints")
+    return project_root() / "checkpoints"
+
+
+def discover_output_dir() -> Path:
+    """Discover a portable output directory."""
+    env_value = os.environ.get("EARTHFORMER_OUTPUT_DIR")
+    if env_value:
+        return Path(env_value)
+    if Path("/content/datasets").exists() or Path("/content").exists():
+        return Path("/content/outputs")
+    return project_root() / "outputs"
+
+
 @dataclass
 class TrainingConfig:
     """Runtime configuration for backbone fine-tuning."""
@@ -70,8 +91,8 @@ class TrainingConfig:
     epochs: int = int(os.environ.get("EARTHFORMER_EPOCHS", "20"))
     num_workers: int = int(os.environ.get("EARTHFORMER_NUM_WORKERS", "2"))
     device: str = os.environ.get("EARTHFORMER_DEVICE", "auto")
-    checkpoint_dir: Path = project_root() / "checkpoints"
-    output_dir: Path = project_root() / "outputs"
+    checkpoint_dir: Path = field(default_factory=discover_checkpoint_dir)
+    output_dir: Path = field(default_factory=discover_output_dir)
     pretrained_checkpoint: Path | None = None
     resume_checkpoint: Path | None = None
     random_seed: int = int(os.environ.get("EARTHFORMER_SEED", "42"))
@@ -82,8 +103,8 @@ class TrainingConfig:
     train_split: str = "train"
     val_split: str = "val"
     image_size: int = 200
-    input_length: int = 13
-    output_length: int = 12
+    input_length: int = int(os.environ.get("EARTHFORMER_INPUT_LENGTH", "13"))
+    output_length: int = int(os.environ.get("EARTHFORMER_OUTPUT_LENGTH", "13"))
     input_channels: int = 7
     output_channels: int = 1
     target_channel_index: int = int(os.environ.get("EARTHFORMER_TARGET_CHANNEL", "0"))
@@ -135,6 +156,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-clip", type=float, default=None)
     parser.add_argument("--scheduler-t-max", type=int, default=None)
     parser.add_argument("--scheduler-eta-min", type=float, default=None)
+    parser.add_argument("--input-length", type=int, default=None)
+    parser.add_argument("--output-length", type=int, default=None)
     parser.add_argument("--target-channel-index", type=int, default=None)
     parser.add_argument("--no-normalize", action="store_true")
     parser.add_argument("--readout-type", type=str, default=None)
@@ -171,6 +194,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "gradient_clip": args.gradient_clip,
         "scheduler_t_max": args.scheduler_t_max,
         "scheduler_eta_min": args.scheduler_eta_min,
+        "input_length": args.input_length,
+        "output_length": args.output_length,
         "target_channel_index": args.target_channel_index,
         "readout_type": args.readout_type,
         "readout_latent_dim": args.readout_latent_dim,

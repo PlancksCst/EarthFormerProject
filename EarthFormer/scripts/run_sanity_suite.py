@@ -64,6 +64,8 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         (config.gradient_clip, "--gradient-clip"),
         (config.scheduler_t_max, "--scheduler-t-max"),
         (config.scheduler_eta_min, "--scheduler-eta-min"),
+        (config.input_length, "--input-length"),
+        (config.output_length, "--output-length"),
         (config.target_channel_index, "--target-channel-index"),
         (config.readout_type, "--readout-type"),
         (config.readout_latent_dim, "--readout-latent-dim"),

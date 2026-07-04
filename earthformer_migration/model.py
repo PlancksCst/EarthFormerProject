@@ -90,7 +90,7 @@ def _adapt_single_channel_conv(weight: torch.Tensor, target_shape: torch.Size) -
 def _default_model_kwargs(
     image_size: int = 200,
     input_length: int = 13,
-    output_length: int = 12,
+    output_length: int = 13,
     input_channels: int = 7,
     output_channels: int = 1,
 ) -> dict[str, Any]:
@@ -153,7 +153,7 @@ def _default_model_kwargs(
 def build_seviri_earthformer(
     image_size: int = 200,
     input_length: int = 13,
-    output_length: int = 12,
+    output_length: int = 13,
     input_channels: int = 7,
     output_channels: int = 1,
 ) -> CuboidTransformerModel:

@@ -17,8 +17,9 @@ if str(PREP_MODELS_ROOT) not in sys.path:
 
 from configs.config import build_arg_parser, config_from_args  # noqa: E402
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
-from models.model import build_training_model  # noqa: E402
+from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint  # noqa: E402
+from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,10 +42,10 @@ def main() -> None:
     loader = build_dataloader(
         config=config,
         split=args.split,
-        include_target=False,
+        include_target=True,
         shuffle=False,
     )
-    model = build_training_model(config).to(device)
+    model = build_perceiver_readout_model(config).to(device)
     if args.model_checkpoint is not None:
         checkpoint = load_checkpoint(args.model_checkpoint, map_location=device)
         model.load_state_dict(checkpoint["model"])
@@ -52,14 +53,27 @@ def main() -> None:
 
     batch = next(iter(loader))
     inputs = batch["satellite"].to(device, non_blocking=True)
+    clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"]).to(
+        device,
+        non_blocking=True,
+    )
     with torch.no_grad():
-        result = model(inputs, return_latent=True)
+        result = model(inputs, return_debug=True)
+        prediction_csi = result["prediction"]
+        prediction_ghi = reconstruct_ghi(prediction_csi, clear_sky_ghi)
+
+    target_csi = batch.get("target")
+    target_ghi = batch.get("target_ghi")
 
     output_file = args.output_file or (config.output_dir / "inference_sample.pt")
     output_file.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "prediction": result["prediction"].cpu(),
+            "prediction_csi": prediction_csi.cpu(),
+            "prediction_ghi": prediction_ghi.cpu(),
+            "target_csi": target_csi.cpu() if isinstance(target_csi, torch.Tensor) else None,
+            "target_ghi": target_ghi.cpu() if isinstance(target_ghi, torch.Tensor) else None,
+            "clear_sky_ghi": clear_sky_ghi.cpu(),
             "pre_head_latent": result["pre_head_latent"].cpu(),
             "sample_id": batch["sample_id"],
             "location": batch["location"],
