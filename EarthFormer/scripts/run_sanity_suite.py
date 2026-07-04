@@ -138,6 +138,21 @@ def main() -> None:
     parser.add_argument("--resume-steps-after-resume", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--report-name", default="run_sanity_suite")
+    parser.add_argument(
+        "--tests",
+        nargs="+",
+        default=["all"],
+        choices=[
+            "all",
+            "pipeline",
+            "inspect",
+            "attention",
+            "one_batch",
+            "overfit",
+            "resume",
+        ],
+        help="Which sanity tests to execute.",
+    )
     args = parser.parse_args()
 
     config = prepare_config(config_from_args(args))
@@ -195,9 +210,29 @@ def main() -> None:
         ),
     ]
 
+    TEST_MAP = {
+        "pipeline": "verify_perceiver_pipeline.py",
+        "inspect": "inspect_perceiver.py",
+        "attention": "check_attention.py",
+        "one_batch": "test_one_batch.py",
+        "overfit": "test_overfit.py",
+        "resume": "test_resume.py",
+    }
+
     results: list[dict[str, Any]] = []
     csv_path = diagnostics_dir(config) / "sanity_suite_summary.csv"
-    for script_name, child_report_name, extra_args in suite:
+    
+    if "all" in args.tests:
+        selected_suite = suite
+    else:
+        selected_scripts = {TEST_MAP[name] for name in args.tests}
+        selected_suite = [
+            item
+            for item in suite
+            if item[0] in selected_scripts
+        ]
+    
+    for script_name, child_report_name, extra_args in selected_suite:
         print(f"Running {script_name}...")
         result = run_child(
             script_name=script_name,
