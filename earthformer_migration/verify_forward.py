@@ -25,12 +25,9 @@ from earthformer_migration.model import (
 from earthformer_migration.seviri_dataset import SEVIRIImageSequenceDataset
 
 
-DEFAULT_DATASET_ROOT = (
-    Path(__file__).resolve().parents[2]
-    / "verification_datasets"
-    / "BEST_7_3months"
+DEFAULT_DATASET_ROOT = Path(
+    "/content/drive/MyDrive/EarthFormer/datasets"
 )
-
 
 def _device_from_arg(value: str) -> torch.device:
     if value == "auto":
