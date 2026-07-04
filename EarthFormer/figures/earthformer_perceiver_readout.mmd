@@ -1,0 +1,9 @@
+flowchart TD
+    A["SEVIRI images<br/>(B,T_in,7,200,200)"] --> B["Official EarthFormer backbone<br/>unchanged pretrained SEVIR model"]
+    B --> C["Pre-head latent<br/>(B,T,H,W,16)"]
+    C --> D["Flatten spatial grid<br/>(B,T,HW,16)"]
+    E["Learnable output queries<br/>(T,D), one query per forecast hour"] --> F
+    D --> F["Perceiver IO output-query cross attention<br/>processed independently for each timestep"]
+    F --> G["Output embeddings<br/>(B,T,D)"]
+    G --> H["Lightweight regression<br/>Linear -> GELU -> Linear"]
+    H --> I["CSI sequence<br/>(B,T)"]

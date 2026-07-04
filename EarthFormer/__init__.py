@@ -1,0 +1,1 @@
+"""EarthFormer SEVIRI training repository."""

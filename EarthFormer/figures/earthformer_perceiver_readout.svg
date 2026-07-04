@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="520" viewBox="0 0 1320 520" role="img" aria-label="EarthFormer Perceiver readout tensor flow">
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#263238"/>
+    </marker>
+    <style>
+      text { font-family: Arial, Helvetica, sans-serif; fill: #17212b; }
+      .box { fill: #f8fafc; stroke: #263238; stroke-width: 2; rx: 8; }
+      .earth { fill: #e8f4ff; stroke: #1264a3; }
+      .latent { fill: #ecfdf3; stroke: #177245; }
+      .readout { fill: #fff7e6; stroke: #a15c00; }
+      .out { fill: #f5edff; stroke: #6f42c1; }
+      .label { font-size: 20px; font-weight: 700; }
+      .shape { font-size: 17px; }
+      .note { font-size: 15px; fill: #485663; }
+      .arrow { stroke: #263238; stroke-width: 2.5; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+  <rect x="30" y="190" width="160" height="120" class="box"/>
+  <text x="110" y="232" text-anchor="middle" class="label">Input</text>
+  <text x="110" y="262" text-anchor="middle" class="shape">(B,Tin,7,200,200)</text>
+  <text x="110" y="286" text-anchor="middle" class="note">SEVIRI only</text>
+
+  <rect x="240" y="175" width="210" height="150" class="box earth"/>
+  <text x="345" y="218" text-anchor="middle" class="label">EarthFormer</text>
+  <text x="345" y="248" text-anchor="middle" class="shape">official backbone</text>
+  <text x="345" y="274" text-anchor="middle" class="note">encoder + decoder</text>
+  <text x="345" y="298" text-anchor="middle" class="note">unchanged pretrained weights</text>
+
+  <rect x="500" y="190" width="170" height="120" class="box latent"/>
+  <text x="585" y="232" text-anchor="middle" class="label">Pre-head latent</text>
+  <text x="585" y="262" text-anchor="middle" class="shape">(B,T,H,W,16)</text>
+  <text x="585" y="286" text-anchor="middle" class="note">before dec_final_proj</text>
+
+  <rect x="720" y="190" width="165" height="120" class="box latent"/>
+  <text x="802.5" y="232" text-anchor="middle" class="label">Spatial tokens</text>
+  <text x="802.5" y="262" text-anchor="middle" class="shape">(B,T,HW,16)</text>
+  <text x="802.5" y="286" text-anchor="middle" class="note">row-major flatten</text>
+
+  <rect x="755" y="35" width="240" height="105" class="box readout"/>
+  <text x="875" y="74" text-anchor="middle" class="label">Output queries</text>
+  <text x="875" y="104" text-anchor="middle" class="shape">(T,D)</text>
+  <text x="875" y="126" text-anchor="middle" class="note">learnable, unconditioned</text>
+
+  <rect x="935" y="175" width="205" height="150" class="box readout"/>
+  <text x="1037.5" y="218" text-anchor="middle" class="label">Cross attention</text>
+  <text x="1037.5" y="248" text-anchor="middle" class="shape">per timestep</text>
+  <text x="1037.5" y="274" text-anchor="middle" class="note">query attends to HW tokens</text>
+  <text x="1037.5" y="298" text-anchor="middle" class="note">no temporal mixing</text>
+
+  <rect x="1190" y="75" width="110" height="105" class="box readout"/>
+  <text x="1245" y="116" text-anchor="middle" class="label">Embedding</text>
+  <text x="1245" y="146" text-anchor="middle" class="shape">(B,T,D)</text>
+
+  <rect x="1188" y="250" width="112" height="105" class="box out"/>
+  <text x="1244" y="290" text-anchor="middle" class="label">Regression</text>
+  <text x="1244" y="318" text-anchor="middle" class="note">Linear GELU</text>
+  <text x="1244" y="340" text-anchor="middle" class="note">Linear</text>
+
+  <rect x="1188" y="390" width="112" height="85" class="box out"/>
+  <text x="1244" y="424" text-anchor="middle" class="label">CSI</text>
+  <text x="1244" y="454" text-anchor="middle" class="shape">(B,T)</text>
+
+  <path class="arrow" d="M190 250 L238 250"/>
+  <path class="arrow" d="M450 250 L498 250"/>
+  <path class="arrow" d="M670 250 L718 250"/>
+  <path class="arrow" d="M885 250 L933 250"/>
+  <path class="arrow" d="M875 140 L978 187"/>
+  <path class="arrow" d="M1140 232 C1180 205 1200 180 1220 180"/>
+  <path class="arrow" d="M1244 180 L1244 248"/>
+  <path class="arrow" d="M1244 355 L1244 388"/>
+</svg>

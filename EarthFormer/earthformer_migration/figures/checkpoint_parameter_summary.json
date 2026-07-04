@@ -1,0 +1,201 @@
+{
+  "checkpoint": "C:\\Users\\admin\\Downloads\\FYP\\Codes\\prep+models\\earthformer_src\\pretrained_checkpoints\\earthformer_sevir.pt",
+  "total_parameters": 8666042,
+  "dec_final_proj": {
+    "weight_shape": [
+      1,
+      16
+    ],
+    "bias_shape": [
+      1
+    ],
+    "parameters": 17,
+    "fraction_percent": 0.00019616798533863557
+  },
+  "top_level": [
+    {
+      "group": "encoder",
+      "parameters": 5590666,
+      "fraction_percent": 64.51233446595343
+    },
+    {
+      "group": "decoder",
+      "parameters": 1880047,
+      "fraction_percent": 21.694413666585046
+    },
+    {
+      "group": "final_decoder",
+      "parameters": 750368,
+      "fraction_percent": 8.658716401328311
+    },
+    {
+      "group": "initial_encoder",
+      "parameters": 357008,
+      "fraction_percent": 4.119620006457389
+    },
+    {
+      "group": "z_proj",
+      "parameters": 65792,
+      "fraction_percent": 0.7591931818470301
+    },
+    {
+      "group": "dec_pos_embed",
+      "parameters": 11264,
+      "fraction_percent": 0.12997859922672889
+    },
+    {
+      "group": "enc_pos_embed",
+      "parameters": 9856,
+      "fraction_percent": 0.11373127432338778
+    },
+    {
+      "group": "init_global_vectors",
+      "parameters": 1024,
+      "fraction_percent": 0.01181623629333899
+    },
+    {
+      "group": "dec_final_proj",
+      "parameters": 17,
+      "fraction_percent": 0.00019616798533863557
+    }
+  ],
+  "largest_tensors": [
+    {
+      "tensor": "decoder.upsample_layers.0.conv.weight",
+      "parameters": 294912,
+      "fraction_percent": 3.403076052481629,
+      "shape": [
+        128,
+        256,
+        3,
+        3
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.0.ffn_1.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        1024,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.0.ffn_2.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.1.ffn_1.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        1024,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.1.ffn_2.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.2.ffn_1.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        1024,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.ffn_l.2.ffn_2.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    {
+      "tensor": "decoder.cross_blocks.1.0.ffn_l.0.ffn_1.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        1024,
+        256
+      ]
+    },
+    {
+      "tensor": "decoder.cross_blocks.1.0.ffn_l.0.ffn_2.weight",
+      "parameters": 262144,
+      "fraction_percent": 3.0249564910947813,
+      "shape": [
+        256,
+        1024
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.0.qkv.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.0.g2g_global_qkv_net.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.1.qkv.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.1.g2g_global_qkv_net.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.2.qkv.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    },
+    {
+      "tensor": "encoder.blocks.1.0.attn_l.2.g2g_global_qkv_net.weight",
+      "parameters": 196608,
+      "fraction_percent": 2.2687173683210857,
+      "shape": [
+        768,
+        256
+      ]
+    }
+  ]
+}
