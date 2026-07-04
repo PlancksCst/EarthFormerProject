@@ -1,7 +1,7 @@
 """Tiny-dataset overfit test for the forecasting model."""
 
 from __future__ import annotations
-
+from tqdm.auto import tqdm
 try:
     from .diagnostic_utils import (
         Timer,
@@ -72,14 +72,20 @@ def main() -> None:
     final_gradient_norm = 0.0
     csv_path = diagnostics_dir(config) / "overfit_history.csv"
 
-    for epoch in range(1, args.max_epochs + 1):
+    epoch_bar = tqdm(
+        range(1, args.max_epochs + 1),
+        desc="Overfit",
+        dynamic_ncols=True,
+    )
+    
+    for epoch in epoch_bar:
         total_loss = 0.0
         total_samples = 0
         prediction_variance = 0.0
         gradient_norm = 0.0
         all_finite = True
 
-        for batch in loader:
+        for batch_idx, batch in enumerate(loader):
             inputs = batch["satellite"].to(device, non_blocking=True)
             target = make_sanity_target(inputs, output_length=config.output_length, mode=args.target_mode)
             step = train_one_batch(
@@ -104,6 +110,13 @@ def main() -> None:
         final_loss = total_loss / max(1, total_samples)
         final_prediction_variance = prediction_variance
         final_gradient_norm = gradient_norm
+
+        epoch_bar.set_postfix(
+            loss=f"{final_loss:.5f}",
+            grad=f"{gradient_norm:.2f}",
+            var=f"{prediction_variance:.5f}",
+        )
+        
         row = {
             "epoch": epoch,
             "loss": final_loss,
@@ -121,6 +134,7 @@ def main() -> None:
 
         if all_finite and final_loss < args.threshold:
             passed = True
+            epoch_bar.close()
             break
         if not all_finite:
             break
