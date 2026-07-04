@@ -27,52 +27,58 @@ except ImportError:
         save_json_report,
     )
 
-from configs.config import build_arg_parser, config_from_args
+from configs.config import TrainingConfig, build_arg_parser, config_from_args
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def optional_arg(args: Any, name: str, flag: str) -> list[str]:
-    """Return a CLI flag/value pair when an argument was explicitly provided."""
-    value = getattr(args, name)
+def optional_value_arg(value: Any, flag: str) -> list[str]:
+    """Return a CLI flag/value pair when a resolved value is available."""
     if value is None:
         return []
     return [flag, str(value)]
 
 
-def common_child_args(args: Any) -> list[str]:
-    """Forward shared config arguments to child scripts."""
+def common_child_args(config: TrainingConfig) -> list[str]:
+    """Forward the resolved config to child scripts.
+
+    Child diagnostics run in separate Python processes. Passing resolved config
+    values prevents them from constructing a fresh default `TrainingConfig` that
+    might fall back to `EarthFormer/data` instead of the caller's dataset path.
+    """
     forwarded: list[str] = []
-    for name, flag in (
-        ("dataset_root", "--dataset-root"),
-        ("metadata_filename", "--metadata-filename"),
-        ("batch_size", "--batch-size"),
-        ("learning_rate", "--learning-rate"),
-        ("weight_decay", "--weight-decay"),
-        ("num_workers", "--num-workers"),
-        ("device", "--device"),
-        ("checkpoint_dir", "--checkpoint-dir"),
-        ("output_dir", "--output-dir"),
-        ("pretrained_checkpoint", "--pretrained-checkpoint"),
-        ("seed", "--seed"),
-        ("gradient_clip", "--gradient-clip"),
-        ("scheduler_t_max", "--scheduler-t-max"),
-        ("scheduler_eta_min", "--scheduler-eta-min"),
-        ("target_channel_index", "--target-channel-index"),
-        ("readout_type", "--readout-type"),
-        ("readout_latent_dim", "--readout-latent-dim"),
-        ("query_dimension", "--query-dimension"),
-        ("num_output_queries", "--num-output-queries"),
-        ("num_attention_heads", "--num-attention-heads"),
-        ("readout_dropout", "--readout-dropout"),
-        ("regression_hidden_dim", "--regression-hidden-dim"),
+    for value, flag in (
+        (config.dataset_root, "--dataset-root"),
+        (config.metadata_filename, "--metadata-filename"),
+        (config.batch_size, "--batch-size"),
+        (config.learning_rate, "--learning-rate"),
+        (config.weight_decay, "--weight-decay"),
+        (config.epochs, "--epochs"),
+        (config.num_workers, "--num-workers"),
+        (config.device, "--device"),
+        (config.checkpoint_dir, "--checkpoint-dir"),
+        (config.output_dir, "--output-dir"),
+        (config.pretrained_checkpoint, "--pretrained-checkpoint"),
+        (config.resume_checkpoint, "--resume-checkpoint"),
+        (config.random_seed, "--seed"),
+        (config.gradient_clip, "--gradient-clip"),
+        (config.scheduler_t_max, "--scheduler-t-max"),
+        (config.scheduler_eta_min, "--scheduler-eta-min"),
+        (config.target_channel_index, "--target-channel-index"),
+        (config.readout_type, "--readout-type"),
+        (config.readout_latent_dim, "--readout-latent-dim"),
+        (config.query_dimension, "--query-dimension"),
+        (config.num_output_queries, "--num-output-queries"),
+        (config.num_attention_heads, "--num-attention-heads"),
+        (config.readout_dropout, "--readout-dropout"),
+        (config.regression_hidden_dim, "--regression-hidden-dim"),
     ):
-        forwarded.extend(optional_arg(args, name, flag))
-    if args.no_amp:
+        forwarded.extend(optional_value_arg(value, flag))
+    if not config.mixed_precision:
         forwarded.append("--no-amp")
-    if args.no_normalize:
+    if not config.normalize:
         forwarded.append("--no-normalize")
-    if args.freeze_earthformer:
+    if config.freeze_earthformer:
         forwarded.append("--freeze-earthformer")
     return forwarded
 
@@ -109,6 +115,7 @@ def run_child(
     return {
         "script": script_name,
         "report_name": report_name,
+        "command": command,
         "status": status,
         "return_code": completed.returncode,
         "execution_time_seconds": elapsed,
@@ -135,7 +142,7 @@ def main() -> None:
 
     config = prepare_config(config_from_args(args))
     timer = Timer()
-    common_args = common_child_args(args)
+    common_args = common_child_args(config)
     split_args = ["--split", args.split]
     target_args = ["--target-mode", args.target_mode]
 
