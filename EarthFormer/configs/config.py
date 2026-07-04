@@ -40,10 +40,13 @@ def discover_dataset_root() -> Path:
 
     root = project_root()
     candidates = [
+        Path("/content/drive/MyDrive/EarthFormer/datasets"),
         root / "data",
         root.parent / "data",
         root.parent.parent / "verification_datasets" / "BEST_7_3months",
         root.parent.parent / "verification_datasets" / "BEST_7_full_year",
+        root.parent.parent.parent / "verification_datasets" / "BEST_7_3months",
+        root.parent.parent.parent / "verification_datasets" / "BEST_7_full_year",
     ]
     kaggle_root = discover_kaggle_dataset_root()
     if kaggle_root is not None:

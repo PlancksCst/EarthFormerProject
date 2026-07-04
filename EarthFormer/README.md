@@ -32,8 +32,16 @@ EarthFormer/
     checkpoint.py
     losses.py
   scripts/
+    diagnostic_utils.py
     verify_forward.py
     verify_perceiver_readout.py
+    verify_perceiver_pipeline.py
+    inspect_perceiver.py
+    check_attention.py
+    test_one_batch.py
+    test_overfit.py
+    test_resume.py
+    run_sanity_suite.py
     inference.py
   figures/
     earthformer_perceiver_readout.mmd
@@ -116,6 +124,7 @@ When `--dataset-root` is omitted, the config tries, in order:
 - `EARTHFORMER_DATASET_ROOT`
 - a single matching Kaggle dataset under `/kaggle/input`
 - local `data/`
+- Google Drive `/content/drive/MyDrive/EarthFormer/datasets`
 - local `../verification_datasets/BEST_7_3months`
 - local `../verification_datasets/BEST_7_full_year`
 
@@ -188,6 +197,52 @@ The architecture diagram is stored at:
 ```text
 figures/earthformer_perceiver_readout.svg
 ```
+
+## Forecasting Sanity Suite
+
+The forecasting diagnostics validate the complete current architecture:
+
+```text
+SEVIRI images
+  -> EarthFormer backbone
+  -> pre_head_latent
+  -> Perceiver IO readout
+  -> CSI-shaped forecast output
+```
+
+Run the full suite in Colab:
+
+```bash
+python EarthFormer/scripts/run_sanity_suite.py \
+  --dataset-root /content/drive/MyDrive/EarthFormer/datasets \
+  --checkpoint-dir /content/drive/MyDrive/EarthFormer/checkpoints \
+  --output-dir /content/drive/MyDrive/EarthFormer/outputs \
+  --batch-size 1 \
+  --num-workers 2 \
+  --device auto
+```
+
+Individual checks:
+
+```bash
+python EarthFormer/scripts/verify_perceiver_pipeline.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+python EarthFormer/scripts/inspect_perceiver.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+python EarthFormer/scripts/check_attention.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+python EarthFormer/scripts/test_one_batch.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+python EarthFormer/scripts/test_overfit.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets --samples 8 --max-epochs 50
+python EarthFormer/scripts/test_resume.py --dataset-root /content/drive/MyDrive/EarthFormer/datasets
+```
+
+All diagnostic outputs are written to:
+
+```text
+outputs/diagnostics/
+```
+
+The optimization sanity tests use a deterministic satellite-only target by
+default. This is only to verify forward/backward/optimizer/checkpoint behavior;
+it does not introduce CSI, GHI, location, time, or auxiliary metadata into the
+model.
 
 ## Checkpointing
 
