@@ -141,6 +141,10 @@ class TrainingConfig:
     early_stopping_patience: int = int(os.environ.get("EARTHFORMER_EARLY_STOPPING_PATIENCE", "5"))
     scheduler_t_max: int | None = None
     scheduler_eta_min: float = float(os.environ.get("EARTHFORMER_ETA_MIN", "1e-6"))
+    clear_sky_threshold: float = float(os.environ.get("EARTHFORMER_CLEAR_SKY_THRESHOLD", "20.0"))
+    low_csi_weight: float = float(os.environ.get("EARTHFORMER_LOW_CSI_WEIGHT", "2.0"))
+    low_csi_threshold: float = float(os.environ.get("EARTHFORMER_LOW_CSI_THRESHOLD", "0.7"))
+    ghi_loss_weight: float = float(os.environ.get("EARTHFORMER_GHI_LOSS_WEIGHT", "0.1"))
     train_split: str = "train"
     val_split: str = "val"
     image_size: int = 200
@@ -206,6 +210,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--early-stopping-patience", type=int, default=None)
     parser.add_argument("--scheduler-t-max", type=int, default=None)
     parser.add_argument("--scheduler-eta-min", type=float, default=None)
+    parser.add_argument("--clear-sky-threshold", type=float, default=None)
+    parser.add_argument("--low-csi-weight", type=float, default=None)
+    parser.add_argument("--low-csi-threshold", type=float, default=None)
+    parser.add_argument("--ghi-loss-weight", type=float, default=None)
     parser.add_argument("--input-length", type=int, default=None)
     parser.add_argument("--output-length", type=int, default=None)
     parser.add_argument("--target-channel-index", type=int, default=None)
@@ -252,6 +260,10 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "early_stopping_patience": args.early_stopping_patience,
         "scheduler_t_max": args.scheduler_t_max,
         "scheduler_eta_min": args.scheduler_eta_min,
+        "clear_sky_threshold": args.clear_sky_threshold,
+        "low_csi_weight": args.low_csi_weight,
+        "low_csi_threshold": args.low_csi_threshold,
+        "ghi_loss_weight": args.ghi_loss_weight,
         "input_length": args.input_length,
         "output_length": args.output_length,
         "target_channel_index": args.target_channel_index,

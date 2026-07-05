@@ -28,7 +28,7 @@ from configs.config import build_arg_parser, config_from_args  # noqa: E402
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint  # noqa: E402
-from training.losses import valid_mask_from_target_mask  # noqa: E402
+from training.losses import valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.precision import amp_dtype_label, autocast_context, resolve_amp_dtype  # noqa: E402
@@ -182,6 +182,7 @@ def save_metric_tables(predictions: pd.DataFrame, dirs: EvaluationDirs) -> dict[
     valid.loc[valid["target_datetime"].isna(), "month"] = "unknown"
 
     overall = pd.DataFrame([paired_metric_row(valid, {"split": str(valid["split"].iloc[0]) if len(valid) else ""})])
+    overall["valid_fraction"] = len(valid) / max(len(predictions), 1)
     per_hour = pd.DataFrame(
         [
             paired_metric_row(group, {"forecast_hour": int(hour)})
@@ -312,13 +313,16 @@ def make_prediction_rows(
                     **metadata,
                     "forecast_hour": hour + 1,
                     "valid": bool(valid[batch_index, hour]),
+                    "valid_hour": bool(valid[batch_index, hour]),
                     "target_csi": float(target_csi[batch_index, hour]),
                     "pred_csi": float(pred_csi[batch_index, hour]),
+                    "predicted_csi": float(pred_csi[batch_index, hour]),
                     "error_csi": float(pred_csi[batch_index, hour] - target_csi[batch_index, hour]),
                     "abs_error_csi": float(abs(pred_csi[batch_index, hour] - target_csi[batch_index, hour])),
                     "clear_sky_ghi": float(clear[batch_index, hour]),
                     "target_ghi": float(target_ghi[batch_index, hour]),
                     "pred_ghi": float(pred_ghi[batch_index, hour]),
+                    "predicted_ghi": float(pred_ghi[batch_index, hour]),
                     "error_ghi": float(pred_ghi[batch_index, hour] - target_ghi[batch_index, hour]),
                     "abs_error_ghi": float(abs(pred_ghi[batch_index, hour] - target_ghi[batch_index, hour])),
                 }
@@ -385,7 +389,12 @@ def run_inference(
             target_mask = batch.get("target_mask")
             if isinstance(target_mask, torch.Tensor):
                 target_mask = target_mask.to(device, non_blocking=True)
-            valid_mask = valid_mask_from_target_mask(target_mask, targets)
+            valid_mask = valid_hour_mask(
+                target_mask=target_mask,
+                reference=targets,
+                clear_sky_ghi=clear_sky_ghi,
+                clear_sky_threshold=config.clear_sky_threshold,
+            )
 
             with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
                 predictions_csi = model(inputs)
@@ -699,8 +708,13 @@ def plot_timeseries_sample(sample: dict[str, Any], kind: str, path: Path) -> Non
     hours = np.arange(1, len(target) + 1)
 
     fig, ax = plt.subplots(figsize=(8.0, 4.4))
-    ax.plot(hours[valid], target[valid], marker="o", label=f"Target {ylabel}", color="#4c78a8")
-    ax.plot(hours[valid], prediction[valid], marker="o", label=f"Predicted {ylabel}", color="#f58518")
+    ax.plot(hours, target, marker="o", label=f"Target {ylabel}", color="#4c78a8")
+    ax.plot(hours, prediction, marker="o", label=f"Predicted {ylabel}", color="#f58518")
+    if not np.all(valid):
+        for hour in hours[~valid]:
+            ax.axvspan(hour - 0.45, hour + 0.45, color="#d0d0d0", alpha=0.25, linewidth=0)
+        ax.scatter(hours[~valid], target[~valid], marker="x", color="#4c78a8", s=55, label="Invalid target")
+        ax.scatter(hours[~valid], prediction[~valid], marker="x", color="#f58518", s=55, label="Invalid prediction")
     ax.set_xticks(hours)
     ax.set_xlabel("Forecast hour (sunrise to sunset)")
     ax.set_ylabel(ylabel)
@@ -755,8 +769,13 @@ def plot_sample_prediction(
         ax.set_yticks([])
 
     ax_series = fig.add_subplot(grid[1, :])
-    ax_series.plot(hours[valid], target[valid], marker="o", label="Target CSI", color="#4c78a8")
-    ax_series.plot(hours[valid], prediction[valid], marker="o", label="Predicted CSI", color="#f58518")
+    ax_series.plot(hours, target, marker="o", label="Target CSI", color="#4c78a8")
+    ax_series.plot(hours, prediction, marker="o", label="Predicted CSI", color="#f58518")
+    if not np.all(valid):
+        for hour in hours[~valid]:
+            ax_series.axvspan(hour - 0.45, hour + 0.45, color="#d0d0d0", alpha=0.25, linewidth=0)
+        ax_series.scatter(hours[~valid], target[~valid], marker="x", color="#4c78a8", s=55, label="Invalid target")
+        ax_series.scatter(hours[~valid], prediction[~valid], marker="x", color="#f58518", s=55, label="Invalid prediction")
     ax_series.set_xticks(hours)
     ax_series.set_xlabel("Forecast hour (sunrise to sunset)")
     ax_series.set_ylabel("CSI")
@@ -803,13 +822,19 @@ def plot_case_from_rows(group: pd.DataFrame, path: Path, title: str) -> None:
     hours = group["forecast_hour"].to_numpy(dtype=int)
     fig, axes = plt.subplots(2, 1, figsize=(8.2, 7.0), sharex=True)
 
-    axes[0].plot(hours[valid], group.loc[valid, "target_csi"], marker="o", label="Target CSI")
-    axes[0].plot(hours[valid], group.loc[valid, "pred_csi"], marker="o", label="Predicted CSI")
+    axes[0].plot(hours, group["target_csi"], marker="o", label="Target CSI")
+    axes[0].plot(hours, group["pred_csi"], marker="o", label="Predicted CSI")
+    if not np.all(valid):
+        for hour in hours[~valid]:
+            axes[0].axvspan(hour - 0.45, hour + 0.45, color="#d0d0d0", alpha=0.25, linewidth=0)
     axes[0].set_ylabel("CSI")
     axes[0].legend()
 
-    axes[1].plot(hours[valid], group.loc[valid, "target_ghi"], marker="o", label="Target GHI")
-    axes[1].plot(hours[valid], group.loc[valid, "pred_ghi"], marker="o", label="Predicted GHI")
+    axes[1].plot(hours, group["target_ghi"], marker="o", label="Target GHI")
+    axes[1].plot(hours, group["pred_ghi"], marker="o", label="Predicted GHI")
+    if not np.all(valid):
+        for hour in hours[~valid]:
+            axes[1].axvspan(hour - 0.45, hour + 0.45, color="#d0d0d0", alpha=0.25, linewidth=0)
     axes[1].set_xlabel("Forecast hour (sunrise to sunset)")
     axes[1].set_ylabel("GHI")
     axes[1].legend()

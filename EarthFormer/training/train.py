@@ -32,7 +32,7 @@ from training.debugging import (  # noqa: E402
     assert_scalar_finite,
 )
 from training.losses import MSELoss  # noqa: E402
-from training.losses import valid_mask_from_target_mask  # noqa: E402
+from training.losses import valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi, validate  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
@@ -101,7 +101,11 @@ class EarthFormerTrainer:
         )
 
         self.model = build_perceiver_readout_model(self.config).to(self.device)
-        self.criterion = MSELoss()
+        self.criterion = MSELoss(
+            low_csi_weight=self.config.low_csi_weight,
+            low_csi_threshold=self.config.low_csi_threshold,
+            ghi_loss_weight=self.config.ghi_loss_weight,
+        )
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
         self.scaler = build_grad_scaler(enabled=self.use_amp, dtype=self.amp_dtype)
@@ -110,6 +114,7 @@ class EarthFormerTrainer:
         self.start_epoch = 1
         self.best_loss = float("inf")
         self.patience_counter = 0
+        self.last_train_metrics: dict[str, float] = {}
 
         if self.config.resume_checkpoint is not None:
             self.start_epoch, self.best_loss = resume_checkpoint(
@@ -185,7 +190,10 @@ class EarthFormerTrainer:
         """Run one training epoch and return average training loss."""
         self.model.train()
         total_loss = 0.0
+        total_csi_loss = 0.0
+        total_ghi_loss = 0.0
         total_valid_positions = 0
+        total_positions = 0
         progress = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.epochs}", leave=False)
 
         for batch_index, batch in enumerate(progress):
@@ -198,6 +206,14 @@ class EarthFormerTrainer:
                 self.device,
                 non_blocking=True,
             )
+            target_ghi = batch.get("target_ghi")
+            if target_ghi is None:
+                target_ghi_tensor = reconstruct_ghi(targets, clear_sky_ghi)
+            else:
+                target_ghi_tensor = ensure_forecast_target(target_ghi, "target_ghi").to(
+                    self.device,
+                    non_blocking=True,
+                )
             target_mask = batch.get("target_mask")
             if isinstance(target_mask, torch.Tensor):
                 target_mask = target_mask.to(self.device, non_blocking=True)
@@ -207,18 +223,28 @@ class EarthFormerTrainer:
                     batch=batch,
                     batch_index=batch_index,
                 )
-            valid_mask = valid_mask_from_target_mask(target_mask, targets)
+            valid_mask = valid_hour_mask(
+                target_mask=target_mask,
+                reference=targets,
+                clear_sky_ghi=clear_sky_ghi,
+                clear_sky_threshold=self.config.clear_sky_threshold,
+            )
             valid_count = int(valid_mask.sum().detach().cpu())
+            total_positions += int(targets.numel())
             if valid_count == 0:
-                raise RuntimeError(
-                    "No valid target positions in training batch. "
-                    "Mask convention is target_mask=0 valid, target_mask=1 invalid."
-                )
+                progress.set_postfix(loss="skip", valid="0.000")
+                continue
             assert_finite("inputs", inputs, batch=batch, batch_index=batch_index)
             assert_finite("targets", targets, batch=batch, batch_index=batch_index)
             assert_finite(
                 "clear_sky_ghi",
                 clear_sky_ghi,
+                batch=batch,
+                batch_index=batch_index,
+            )
+            assert_finite(
+                "target_ghi",
+                target_ghi_tensor,
                 batch=batch,
                 batch_index=batch_index,
             )
@@ -247,7 +273,22 @@ class EarthFormerTrainer:
                     batch=batch,
                     batch_index=batch_index,
                 )
-                loss = self.criterion(predictions, targets, valid_mask=valid_mask)
+                loss_result = self.criterion(
+                    predictions,
+                    targets,
+                    valid_mask=valid_mask,
+                    clear_sky_ghi=clear_sky_ghi,
+                    target_ghi=target_ghi_tensor,
+                    return_components=True,
+                )
+                if isinstance(loss_result, dict):
+                    loss = loss_result["loss"]
+                    csi_loss = loss_result["csi_loss"]
+                    ghi_loss = loss_result["ghi_loss"]
+                else:
+                    loss = loss_result
+                    csi_loss = loss_result
+                    ghi_loss = loss_result.new_zeros(())
                 assert_scalar_finite(
                     "loss",
                     loss,
@@ -285,16 +326,27 @@ class EarthFormerTrainer:
             self.scaler.update()
 
             total_loss += float(loss.item()) * valid_count
+            total_csi_loss += float(csi_loss.detach().cpu()) * valid_count
+            total_ghi_loss += float(ghi_loss.detach().cpu()) * valid_count
             total_valid_positions += valid_count
             progress.set_postfix(
                 loss=f"{loss.item():.5f}",
+                csi=f"{float(csi_loss.detach().cpu()):.5f}",
+                ghi=f"{float(ghi_loss.detach().cpu()):.5f}",
+                valid=f"{valid_count / max(targets.numel(), 1):.3f}",
                 grad=f"{float(gradient_stats['total_norm']):.3e}",
                 lr=f"{self.current_lr():.3e}",
             )
 
         if total_valid_positions == 0:
-            raise ValueError("Training dataloader produced no samples")
-        return total_loss / total_valid_positions
+            raise ValueError("Training dataloader produced no physically valid target hours")
+        self.last_train_metrics = {
+            "train_loss": total_loss / total_valid_positions,
+            "train_csi_loss": total_csi_loss / total_valid_positions,
+            "train_ghi_loss": total_ghi_loss / total_valid_positions,
+            "train_valid_fraction": total_valid_positions / max(total_positions, 1),
+        }
+        return self.last_train_metrics["train_loss"]
 
     def checkpoint_extra_state(self) -> dict[str, float | int | str]:
         """Return trainer state needed for exact early-stopping resume."""
@@ -359,6 +411,7 @@ class EarthFormerTrainer:
             "hour",
             "forecast_hour",
             "valid",
+            "valid_hour",
             "target_csi",
             "predicted_csi",
             "target_ghi",
@@ -398,6 +451,7 @@ class EarthFormerTrainer:
                 use_amp=self.use_amp,
                 amp_dtype=self.amp_dtype,
                 collect_predictions=True,
+                clear_sky_threshold=self.config.clear_sky_threshold,
             )
             validation_loss = float(validation_metrics["val_loss"])
             lrs = self.current_lrs()
@@ -416,15 +470,23 @@ class EarthFormerTrainer:
             row = {
                 "epoch": epoch,
                 "train_loss": float(train_loss),
+                "train_csi_loss": float(self.last_train_metrics.get("train_csi_loss", train_loss)),
+                "train_ghi_loss": float(self.last_train_metrics.get("train_ghi_loss", 0.0)),
+                "train_valid_fraction": float(self.last_train_metrics.get("train_valid_fraction", 0.0)),
                 "val_loss": validation_loss,
+                "val_csi_loss": float(validation_metrics["val_csi_loss"]),
+                "val_ghi_loss": float(validation_metrics["val_ghi_loss"]),
+                "valid_fraction": float(validation_metrics["valid_fraction"]),
                 "CSI_MAE": float(validation_metrics["CSI_MAE"]),
                 "CSI_RMSE": float(validation_metrics["CSI_RMSE"]),
                 "CSI_nRMSE": float(validation_metrics["CSI_nRMSE"]),
                 "CSI_R2": float(validation_metrics["CSI_R2"]),
+                "CSI_MBE": float(validation_metrics["CSI_MBE"]),
                 "GHI_MAE": float(validation_metrics["GHI_MAE"]),
                 "GHI_RMSE": float(validation_metrics["GHI_RMSE"]),
                 "GHI_nRMSE": float(validation_metrics["GHI_nRMSE"]),
                 "GHI_R2": float(validation_metrics["GHI_R2"]),
+                "GHI_MBE": float(validation_metrics["GHI_MBE"]),
                 "learning_rate": float(lrs.get("head", self.current_lr())),
                 "lr_backbone": float(lrs.get("backbone", 0.0)),
                 "lr_head": float(lrs.get("head", self.current_lr())),
@@ -455,7 +517,12 @@ class EarthFormerTrainer:
             print(
                 f"Epoch {epoch:03d}\n"
                 f"Train Loss: {train_loss:.6f}\n"
+                f"Train CSI Loss: {self.last_train_metrics.get('train_csi_loss', train_loss):.6f}\n"
+                f"Train GHI Loss: {self.last_train_metrics.get('train_ghi_loss', 0.0):.6f}\n"
                 f"Validation Loss: {validation_loss:.6f}\n"
+                f"Validation CSI Loss: {validation_metrics['val_csi_loss']:.6f}\n"
+                f"Validation GHI Loss: {validation_metrics['val_ghi_loss']:.6f}\n"
+                f"Valid Fraction: {validation_metrics['valid_fraction']:.3f}\n"
                 f"CSI RMSE: {validation_metrics['CSI_RMSE']:.6f}\n"
                 f"CSI MAE: {validation_metrics['CSI_MAE']:.6f}\n"
                 f"GHI RMSE: {validation_metrics['GHI_RMSE']:.6f}\n"
@@ -523,6 +590,21 @@ class EarthFormerTrainer:
 
         inputs = batch["satellite"].to(self.device)
         targets = ensure_forecast_target(batch["target"]).to(self.device)
+        clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(self.device)
+        target_ghi_value = batch.get("target_ghi")
+        if target_ghi_value is None:
+            target_ghi = reconstruct_ghi(targets, clear_sky_ghi)
+        else:
+            target_ghi = ensure_forecast_target(target_ghi_value, "target_ghi").to(self.device)
+        target_mask = batch.get("target_mask")
+        if isinstance(target_mask, torch.Tensor):
+            target_mask = target_mask.to(self.device)
+        valid_mask = valid_hour_mask(
+            target_mask=target_mask,
+            reference=targets,
+            clear_sky_ghi=clear_sky_ghi,
+            clear_sky_threshold=self.config.clear_sky_threshold,
+        )
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -535,7 +617,10 @@ class EarthFormerTrainer:
 
             loss = self.criterion(
                 prediction,
-                targets
+                targets,
+                valid_mask=valid_mask,
+                clear_sky_ghi=clear_sky_ghi,
+                target_ghi=target_ghi,
             )
 
         print(f"Loss: {loss.item():.6f}")
@@ -661,12 +746,30 @@ class EarthFormerTrainer:
             self.model.train()
 
             running = 0
+            steps = 0
 
             for batch in loader:
 
                 inputs = batch["satellite"].to(self.device)
 
                 targets = ensure_forecast_target(batch["target"]).to(self.device)
+                clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(self.device)
+                target_ghi_value = batch.get("target_ghi")
+                if target_ghi_value is None:
+                    target_ghi = reconstruct_ghi(targets, clear_sky_ghi)
+                else:
+                    target_ghi = ensure_forecast_target(target_ghi_value, "target_ghi").to(self.device)
+                target_mask = batch.get("target_mask")
+                if isinstance(target_mask, torch.Tensor):
+                    target_mask = target_mask.to(self.device)
+                valid_mask = valid_hour_mask(
+                    target_mask=target_mask,
+                    reference=targets,
+                    clear_sky_ghi=clear_sky_ghi,
+                    clear_sky_threshold=self.config.clear_sky_threshold,
+                )
+                if int(valid_mask.sum().detach().cpu()) == 0:
+                    continue
 
                 self.optimizer.zero_grad()
 
@@ -680,7 +783,10 @@ class EarthFormerTrainer:
 
                     loss = self.criterion(
                         prediction,
-                        targets
+                        targets,
+                        valid_mask=valid_mask,
+                        clear_sky_ghi=clear_sky_ghi,
+                        target_ghi=target_ghi,
                     )
 
                 self.scaler.scale(loss).backward()
@@ -699,8 +805,11 @@ class EarthFormerTrainer:
                 self.scaler.update()
 
                 running += loss.item()
+                steps += 1
 
-            running /= len(loader)
+            if steps == 0:
+                raise RuntimeError("Tiny overfit batch contained no physically valid target hours.")
+            running /= steps
 
             print(
                 f"Epoch {epoch+1:03d}"
@@ -750,6 +859,7 @@ class EarthFormerTrainer:
                 device=self.device,
                 use_amp=self.use_amp,
                 amp_dtype=self.amp_dtype,
+                clear_sky_threshold=self.config.clear_sky_threshold,
             )
             val = float(val_metrics["val_loss"])
 
@@ -771,15 +881,23 @@ class EarthFormerTrainer:
             self.logger.log(
                 epoch=epoch,
                 train_loss=train,
+                train_csi_loss=self.last_train_metrics.get("train_csi_loss", train),
+                train_ghi_loss=self.last_train_metrics.get("train_ghi_loss", 0.0),
+                train_valid_fraction=self.last_train_metrics.get("train_valid_fraction", 0.0),
                 val_loss=val,
+                val_csi_loss=float(val_metrics["val_csi_loss"]),
+                val_ghi_loss=float(val_metrics["val_ghi_loss"]),
+                valid_fraction=float(val_metrics["valid_fraction"]),
                 CSI_MAE=float(val_metrics["CSI_MAE"]),
                 CSI_RMSE=float(val_metrics["CSI_RMSE"]),
                 CSI_nRMSE=float(val_metrics["CSI_nRMSE"]),
                 CSI_R2=float(val_metrics["CSI_R2"]),
+                CSI_MBE=float(val_metrics["CSI_MBE"]),
                 GHI_MAE=float(val_metrics["GHI_MAE"]),
                 GHI_RMSE=float(val_metrics["GHI_RMSE"]),
                 GHI_nRMSE=float(val_metrics["GHI_nRMSE"]),
                 GHI_R2=float(val_metrics["GHI_R2"]),
+                GHI_MBE=float(val_metrics["GHI_MBE"]),
                 learning_rate=lrs.get("head", self.current_lr()),
                 lr_backbone=lrs.get("backbone", 0.0),
                 lr_head=lrs.get("head", self.current_lr()),

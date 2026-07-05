@@ -88,6 +88,12 @@ def plot_forecast_sample(
     prediction_key = f"prediction_{kind}"
     target = _to_list(sample[target_key])
     prediction = _to_list(sample[prediction_key])
+    valid_mask = sample.get("valid_mask")
+    valid = None
+    if valid_mask is not None:
+        valid = [bool(item) for item in _to_list(valid_mask)]
+        if len(valid) != len(target):
+            valid = None
     hours = list(range(1, len(target) + 1))
 
     path = plots_dir(output_dir) / f"{kind}_prediction_epoch_{epoch:03d}.png"
@@ -101,6 +107,30 @@ def plot_forecast_sample(
     fig, ax = plt.subplots(figsize=(8, 4.5))
     ax.plot(hours, target, marker="o", label=f"Ground truth {label}")
     ax.plot(hours, prediction, marker="o", label=f"Predicted {label}")
+    if valid is not None and not all(valid):
+        invalid_hours = [hour for hour, is_valid in zip(hours, valid) if not is_valid]
+        invalid_target = [value for value, is_valid in zip(target, valid) if not is_valid]
+        invalid_prediction = [value for value, is_valid in zip(prediction, valid) if not is_valid]
+        for hour in invalid_hours:
+            ax.axvspan(hour - 0.45, hour + 0.45, color="#d0d0d0", alpha=0.25, linewidth=0)
+        ax.scatter(
+            invalid_hours,
+            invalid_target,
+            marker="x",
+            color="#4c78a8",
+            s=60,
+            label=f"Invalid target {label}",
+            zorder=4,
+        )
+        ax.scatter(
+            invalid_hours,
+            invalid_prediction,
+            marker="x",
+            color="#f58518",
+            s=60,
+            label=f"Invalid predicted {label}",
+            zorder=4,
+        )
     ax.set_xlabel("Forecast hour")
     ax.set_ylabel(label)
     ax.set_title(" | ".join(title_parts))
@@ -130,7 +160,7 @@ def save_training_plots(
 
 
 def _valid_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if bool(row.get("valid", True))]
+    return [row for row in rows if bool(row.get("valid_hour", row.get("valid", True)))]
 
 
 def _row_values(rows: list[dict[str, Any]], key: str) -> list[float]:

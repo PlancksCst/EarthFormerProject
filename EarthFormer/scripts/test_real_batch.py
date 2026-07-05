@@ -28,7 +28,7 @@ from training.debugging import (  # noqa: E402
     assert_scalar_finite,
     tensor_stats,
 )
-from training.losses import MSELoss, valid_mask_from_target_mask  # noqa: E402
+from training.losses import MSELoss, valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.precision import (  # noqa: E402
@@ -96,7 +96,11 @@ def main() -> None:
         shuffle=False,
     )
     model = build_perceiver_readout_model(config).to(device)
-    criterion = MSELoss()
+    criterion = MSELoss(
+        low_csi_weight=config.low_csi_weight,
+        low_csi_threshold=config.low_csi_threshold,
+        ghi_loss_weight=config.ghi_loss_weight,
+    )
     optimizer = AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -112,11 +116,24 @@ def main() -> None:
         device,
         non_blocking=True,
     )
+    target_ghi_value = batch.get("target_ghi")
+    if target_ghi_value is None:
+        target_ghi = reconstruct_ghi(targets, clear_sky_ghi)
+    else:
+        target_ghi = ensure_forecast_target(target_ghi_value, "target_ghi").to(
+            device,
+            non_blocking=True,
+        )
     target_mask = batch.get("target_mask")
     if isinstance(target_mask, torch.Tensor):
         target_mask = target_mask.to(device, non_blocking=True)
         assert_finite("target_mask", target_mask.float(), batch=batch, batch_index=0)
-    valid_mask = valid_mask_from_target_mask(target_mask, targets)
+    valid_mask = valid_hour_mask(
+        target_mask=target_mask,
+        reference=targets,
+        clear_sky_ghi=clear_sky_ghi,
+        clear_sky_threshold=config.clear_sky_threshold,
+    )
     valid_count = int(valid_mask.sum().detach().cpu())
     if valid_count == 0:
         raise RuntimeError(
@@ -127,6 +144,7 @@ def main() -> None:
     assert_finite("inputs", inputs, batch=batch, batch_index=0)
     assert_finite("targets", targets, batch=batch, batch_index=0)
     assert_finite("clear_sky_ghi", clear_sky_ghi, batch=batch, batch_index=0)
+    assert_finite("target_ghi", target_ghi, batch=batch, batch_index=0)
 
     optimizer.zero_grad(set_to_none=True)
     with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
@@ -134,7 +152,22 @@ def main() -> None:
         assert_finite("predictions", predictions, batch=batch, batch_index=0)
         predicted_ghi = reconstruct_ghi(predictions, clear_sky_ghi)
         assert_finite("predicted_ghi", predicted_ghi, batch=batch, batch_index=0)
-        loss = criterion(predictions, targets, valid_mask=valid_mask)
+        loss_result = criterion(
+            predictions,
+            targets,
+            valid_mask=valid_mask,
+            clear_sky_ghi=clear_sky_ghi,
+            target_ghi=target_ghi,
+            return_components=True,
+        )
+        if isinstance(loss_result, dict):
+            loss = loss_result["loss"]
+            csi_loss = loss_result["csi_loss"]
+            ghi_loss = loss_result["ghi_loss"]
+        else:
+            loss = loss_result
+            csi_loss = loss_result
+            ghi_loss = loss_result.new_zeros(())
         assert_scalar_finite("loss", loss, batch=batch, batch_index=0)
 
     scaler.scale(loss).backward()
@@ -158,12 +191,16 @@ def main() -> None:
         "amp_dtype": amp_dtype_label(amp_dtype),
         "sample": first_values(batch),
         "valid_count": valid_count,
+        "valid_fraction": valid_count / max(targets.numel(), 1),
         "input": tensor_stats(inputs),
         "target": tensor_stats(targets),
         "clear_sky_ghi": tensor_stats(clear_sky_ghi),
+        "target_ghi": tensor_stats(target_ghi),
         "prediction": tensor_stats(predictions),
         "predicted_ghi": tensor_stats(predicted_ghi),
         "loss": float(loss.detach().cpu()),
+        "csi_loss": float(csi_loss.detach().cpu()),
+        "ghi_loss": float(ghi_loss.detach().cpu()),
         "gradient_stats": gradient_stats,
         "optimizer_step": "completed",
     }

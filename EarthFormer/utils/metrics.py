@@ -15,6 +15,11 @@ def rmse(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean((prediction - target) ** 2))
 
 
+def mbe(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Return mean bias error."""
+    return torch.mean(prediction - target)
+
+
 def nrmse(
     prediction: torch.Tensor,
     target: torch.Tensor,
@@ -41,12 +46,24 @@ def forecast_metrics(
     target: torch.Tensor,
     prefix: str,
 ) -> dict[str, float]:
-    """Return scalar MAE, RMSE, nRMSE, and R2 metrics with a prefix."""
+    """Return scalar MAE, RMSE, nRMSE, R2, and MBE metrics with a prefix."""
     prediction = prediction.detach().float().reshape(-1)
     target = target.detach().float().reshape(-1)
+    finite = torch.isfinite(prediction) & torch.isfinite(target)
+    prediction = prediction[finite]
+    target = target[finite]
+    if prediction.numel() == 0:
+        return {
+            f"{prefix}_MAE": float("nan"),
+            f"{prefix}_RMSE": float("nan"),
+            f"{prefix}_nRMSE": float("nan"),
+            f"{prefix}_R2": float("nan"),
+            f"{prefix}_MBE": float("nan"),
+        }
     return {
         f"{prefix}_MAE": float(mae(prediction, target).cpu()),
         f"{prefix}_RMSE": float(rmse(prediction, target).cpu()),
         f"{prefix}_nRMSE": float(nrmse(prediction, target).cpu()),
         f"{prefix}_R2": float(r2_score(prediction, target).cpu()),
+        f"{prefix}_MBE": float(mbe(prediction, target).cpu()),
     }

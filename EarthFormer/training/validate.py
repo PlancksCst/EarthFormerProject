@@ -11,10 +11,10 @@ from torch.utils.data import DataLoader
 
 try:
     from training.debugging import assert_finite, assert_scalar_finite
-    from training.losses import valid_mask_from_target_mask
+    from training.losses import valid_hour_mask
 except ImportError:
     from EarthFormer.training.debugging import assert_finite, assert_scalar_finite  # type: ignore
-    from EarthFormer.training.losses import valid_mask_from_target_mask  # type: ignore
+    from EarthFormer.training.losses import valid_hour_mask  # type: ignore
 
 try:
     from utils.metrics import forecast_metrics
@@ -93,6 +93,7 @@ def _prediction_rows(
                     "hour": hour_index + 1,
                     "forecast_hour": hour_index + 1,
                     "valid": bool(valid[sample_index, hour_index]),
+                    "valid_hour": bool(valid[sample_index, hour_index]),
                     "target_csi": float(target_csi[sample_index, hour_index]),
                     "predicted_csi": float(pred_csi[sample_index, hour_index]),
                     "target_ghi": float(target_ghi[sample_index, hour_index]),
@@ -112,6 +113,7 @@ def validate(
     use_amp: bool = False,
     amp_dtype: torch.dtype | None = None,
     collect_predictions: bool = False,
+    clear_sky_threshold: float = 20.0,
     **_: Any,
 ) -> dict[str, Any]:
     """Return validation loss, forecasting metrics, and optional prediction rows.
@@ -119,13 +121,17 @@ def validate(
     When ``collect_predictions`` is false, this preserves the historical
     validation contract: scalar validation metrics plus a single sample for
     plotting. When true, the result also contains a ``predictions`` list with
-    one row per valid forecast hour for CSV logging and diagnostic plots.
+    one row per forecast hour and a ``valid_hour`` flag for CSV logging and
+    diagnostic plots.
     Extra keyword arguments are accepted for backwards-compatible integration
     with training scripts that may pass optional validation controls.
     """
     model.eval()
     total_loss = 0.0
+    total_csi_loss = 0.0
+    total_ghi_loss = 0.0
     total_valid_positions = 0
+    total_positions = 0
     amp_enabled = use_amp and device.type == "cuda"
     csi_predictions: list[torch.Tensor] = []
     csi_targets: list[torch.Tensor] = []
@@ -161,13 +167,15 @@ def validate(
                 batch=batch,
                 batch_index=batch_index,
             )
-        valid_mask = valid_mask_from_target_mask(target_mask, targets)
+        valid_mask = valid_hour_mask(
+            target_mask=target_mask,
+            reference=targets,
+            clear_sky_ghi=clear_sky_ghi,
+            clear_sky_threshold=clear_sky_threshold,
+        )
         valid_count = int(valid_mask.sum().detach().cpu())
-        if valid_count == 0:
-            raise RuntimeError(
-                "No valid target positions in validation batch. "
-                "Mask convention is target_mask=0 valid, target_mask=1 invalid."
-            )
+        total_positions += int(targets.numel())
+        has_valid_hours = valid_count > 0
 
         assert_finite("inputs", inputs, batch=batch, batch_index=batch_index)
         assert_finite("targets", targets, batch=batch, batch_index=batch_index)
@@ -197,8 +205,28 @@ def validate(
                 batch=batch,
                 batch_index=batch_index,
             )
-            loss = criterion(predictions, targets, valid_mask=valid_mask)
-            assert_scalar_finite("loss", loss, batch=batch, batch_index=batch_index)
+            if has_valid_hours:
+                loss_result = criterion(
+                    predictions,
+                    targets,
+                    valid_mask=valid_mask,
+                    clear_sky_ghi=clear_sky_ghi,
+                    target_ghi=target_ghi_tensor,
+                    return_components=True,
+                )
+                if isinstance(loss_result, dict):
+                    loss = loss_result["loss"]
+                    csi_loss = loss_result["csi_loss"]
+                    ghi_loss = loss_result["ghi_loss"]
+                else:
+                    loss = loss_result
+                    csi_loss = loss_result
+                    ghi_loss = loss_result.new_zeros(())
+                assert_scalar_finite("loss", loss, batch=batch, batch_index=batch_index)
+            else:
+                loss = predictions.new_zeros(())
+                csi_loss = predictions.new_zeros(())
+                ghi_loss = predictions.new_zeros(())
 
         prediction_ghi = reconstruct_ghi(predictions, clear_sky_ghi)
         assert_finite(
@@ -207,14 +235,18 @@ def validate(
             batch=batch,
             batch_index=batch_index,
         )
-        total_loss += float(loss.item()) * valid_count
-        total_valid_positions += valid_count
+        if has_valid_hours:
+            total_loss += float(loss.item()) * valid_count
+            total_csi_loss += float(csi_loss.detach().cpu()) * valid_count
+            total_ghi_loss += float(ghi_loss.detach().cpu()) * valid_count
+            total_valid_positions += valid_count
 
         valid_mask_cpu = valid_mask.detach().cpu()
-        csi_predictions.append(predictions.detach().cpu()[valid_mask_cpu])
-        csi_targets.append(targets.detach().cpu()[valid_mask_cpu])
-        ghi_predictions.append(prediction_ghi.detach().cpu()[valid_mask_cpu])
-        ghi_targets.append(target_ghi_tensor.detach().cpu()[valid_mask_cpu])
+        if has_valid_hours:
+            csi_predictions.append(predictions.detach().cpu()[valid_mask_cpu])
+            csi_targets.append(targets.detach().cpu()[valid_mask_cpu])
+            ghi_predictions.append(prediction_ghi.detach().cpu()[valid_mask_cpu])
+            ghi_targets.append(target_ghi_tensor.detach().cpu()[valid_mask_cpu])
         if collect_predictions:
             prediction_rows.extend(
                 _prediction_rows(
@@ -235,6 +267,7 @@ def validate(
                 "prediction_ghi": prediction_ghi[0].detach().cpu(),
                 "target_ghi": target_ghi_tensor[0].detach().cpu(),
                 "clear_sky_ghi": clear_sky_ghi[0].detach().cpu(),
+                "valid_mask": valid_mask[0].detach().cpu(),
                 "sample_id": _first_metadata_value(batch, "sample_id"),
                 "location": _first_metadata_value(batch, "location"),
                 "input_day": _first_metadata_value(batch, "input_day"),
@@ -242,14 +275,19 @@ def validate(
             }
 
     if total_valid_positions == 0:
-        raise ValueError("Validation dataloader produced no samples")
+        raise ValueError("Validation dataloader produced no physically valid target hours")
 
     all_csi_predictions = torch.cat(csi_predictions, dim=0)
     all_csi_targets = torch.cat(csi_targets, dim=0)
     all_ghi_predictions = torch.cat(ghi_predictions, dim=0)
     all_ghi_targets = torch.cat(ghi_targets, dim=0)
 
-    metrics: dict[str, Any] = {"val_loss": total_loss / total_valid_positions}
+    metrics: dict[str, Any] = {
+        "val_loss": total_loss / total_valid_positions,
+        "val_csi_loss": total_csi_loss / total_valid_positions,
+        "val_ghi_loss": total_ghi_loss / total_valid_positions,
+        "valid_fraction": total_valid_positions / max(total_positions, 1),
+    }
     metrics.update(forecast_metrics(all_csi_predictions, all_csi_targets, prefix="CSI"))
     metrics.update(forecast_metrics(all_ghi_predictions, all_ghi_targets, prefix="GHI"))
     metrics["sample"] = sample

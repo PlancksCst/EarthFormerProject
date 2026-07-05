@@ -19,6 +19,7 @@ from configs.config import build_arg_parser, config_from_args  # noqa: E402
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint  # noqa: E402
+from training.losses import valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 
@@ -65,6 +66,19 @@ def main() -> None:
 
     target_csi = batch.get("target")
     target_ghi = batch.get("target_ghi")
+    target_mask = batch.get("target_mask")
+    if isinstance(target_csi, torch.Tensor):
+        target_csi_device = ensure_forecast_target(target_csi).to(device, non_blocking=True)
+        if isinstance(target_mask, torch.Tensor):
+            target_mask = target_mask.to(device, non_blocking=True)
+        valid_hour = valid_hour_mask(
+            target_mask=target_mask,
+            reference=target_csi_device,
+            clear_sky_ghi=clear_sky_ghi,
+            clear_sky_threshold=config.clear_sky_threshold,
+        ).cpu()
+    else:
+        valid_hour = None
 
     output_file = args.output_file or (config.output_dir / "inference_sample.pt")
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -75,6 +89,7 @@ def main() -> None:
             "target_csi": target_csi.cpu() if isinstance(target_csi, torch.Tensor) else None,
             "target_ghi": target_ghi.cpu() if isinstance(target_ghi, torch.Tensor) else None,
             "clear_sky_ghi": clear_sky_ghi.cpu(),
+            "valid_hour": valid_hour,
             "pre_head_latent": result["pre_head_latent"].cpu(),
             "sample_id": batch["sample_id"],
             "location": batch["location"],

@@ -144,6 +144,10 @@ python training/train.py \
   --head-learning-rate 1e-4 \
   --warmup-epochs 5 \
   --early-stopping-patience 5 \
+  --clear-sky-threshold 20.0 \
+  --low-csi-weight 2.0 \
+  --low-csi-threshold 0.7 \
+  --ghi-loss-weight 0.1 \
   --epochs 20 \
   --input-length 13 \
   --output-length 13 \
@@ -162,6 +166,10 @@ The training loop includes:
 - BF16 autocast by default when AMP is enabled; FP16 requires `--amp-dtype fp16`
 - gradient clipping
 - validation every epoch
+- physical valid-hour masking with `target_mask == 0` and
+  `clear_sky_ghi > --clear-sky-threshold`
+- weighted CSI loss for low-CSI cloudy hours
+- optional reconstructed-GHI loss term controlled by `--ghi-loss-weight`
 - `tqdm` progress bar
 - CSV logging with CSI and reconstructed-GHI metrics
 - validation prediction CSVs under `outputs/predictions/`
