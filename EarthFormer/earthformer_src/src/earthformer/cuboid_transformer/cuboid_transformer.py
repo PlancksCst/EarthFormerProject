@@ -911,11 +911,13 @@ class CuboidSelfAttentionLayer(nn.Module):
                 with _autocast(enabled=False):
                     attn_score_l2l_l2g = masked_softmax(attn_score_l2l_l2g, mask=attn_mask_l2l_l2g)
                     attn_score_l2l_l2g = self.attn_drop(attn_score_l2l_l2g)
+                    v_l_g = v_l_g.to(dtype=attn_score_l2l_l2g.dtype)
                     reordered_x = (attn_score_l2l_l2g @ v_l_g).permute(0, 2, 3, 1, 4) \
                         .reshape(B, num_cuboids, cuboid_volume, self.dim)
             else:
                 attn_score_l2l_l2g = masked_softmax(attn_score_l2l_l2g, mask=attn_mask_l2l_l2g)
                 attn_score_l2l_l2g = self.attn_drop(attn_score_l2l_l2g)
+                v_l_g = v_l_g.to(dtype=attn_score_l2l_l2g.dtype)
                 reordered_x = (attn_score_l2l_l2g @ v_l_g).permute(0, 2, 3, 1, 4) \
                     .reshape(B, num_cuboids, cuboid_volume, self.dim)
             # update global vectors
@@ -958,11 +960,13 @@ class CuboidSelfAttentionLayer(nn.Module):
                 with _autocast(enabled=False):
                     g2all_attn_score = masked_softmax(g2all_attn_score, mask=g2all_attn_mask)
                     g2all_attn_score = self.global_attn_drop(g2all_attn_score)
+                    new_v = new_v.to(dtype=g2all_attn_score.dtype)
                     new_global_vector = (g2all_attn_score @ new_v).permute(0, 2, 1, 3).\
                         reshape(B, num_global, self.global_dim_ratio*self.dim)
             else:
                 g2all_attn_score = masked_softmax(g2all_attn_score, mask=g2all_attn_mask)
                 g2all_attn_score = self.global_attn_drop(g2all_attn_score)
+                new_v = new_v.to(dtype=g2all_attn_score.dtype)
                 new_global_vector = (g2all_attn_score @ new_v).permute(0, 2, 1, 3).\
                     reshape(B, num_global, self.global_dim_ratio*self.dim)
         else:
@@ -977,10 +981,12 @@ class CuboidSelfAttentionLayer(nn.Module):
                 with _autocast(enabled=False):
                     attn_score = masked_softmax(attn_score, mask=attn_mask)
                     attn_score = self.attn_drop(attn_score)
+                    v = v.to(dtype=attn_score.dtype)
                     reordered_x = (attn_score @ v).permute(0, 2, 3, 1, 4).reshape(B, num_cuboids, cuboid_volume, self.dim)
             else:
                 attn_score = masked_softmax(attn_score, mask=attn_mask)
                 attn_score = self.attn_drop(attn_score)  # Shape (B, num_heads, num_cuboids, cuboid_volume, cuboid_volume (+ K))
+                v = v.to(dtype=attn_score.dtype)
                 reordered_x = (attn_score @ v).permute(0, 2, 3, 1, 4).reshape(B, num_cuboids, cuboid_volume, self.dim)
 
         if self.use_final_proj:
@@ -1570,11 +1576,13 @@ class CuboidCrossAttentionLayer(nn.Module):
             # local to local and global attention
             attn_score_l2l_l2g = masked_softmax(attn_score_l2l_l2g, mask=attn_mask_l2l_l2g)
             attn_score_l2l_l2g = self.attn_drop(attn_score_l2l_l2g)  # Shape (B, num_heads, num_cuboids, x_cuboid_volume, mem_cuboid_volume + K))
+            v_l_g = v_l_g.to(dtype=attn_score_l2l_l2g.dtype)
             reordered_x = (attn_score_l2l_l2g @ v_l_g).permute(0, 2, 3, 1, 4) \
                 .reshape(B, num_cuboids, x_cuboid_volume, self.dim)
         else:
             attn_score = masked_softmax(attn_score, mask=attn_mask)
             attn_score = self.attn_drop(attn_score)  # Shape (B, num_heads, num_cuboids, x_cuboid_volume, mem_cuboid_volume)
+            v = v.to(dtype=attn_score.dtype)
             reordered_x = (attn_score @ v).permute(0, 2, 3, 1, 4).reshape(B, num_cuboids, x_cuboid_volume, self.dim)
         reordered_x = self.proj_drop(self.proj(reordered_x))
         # Step-5: Shift back and slice
