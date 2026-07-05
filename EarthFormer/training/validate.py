@@ -112,8 +112,17 @@ def validate(
     use_amp: bool = False,
     amp_dtype: torch.dtype | None = None,
     collect_predictions: bool = False,
+    **_: Any,
 ) -> dict[str, Any]:
-    """Return validation loss, CSI metrics, GHI metrics, and one plot sample."""
+    """Return validation loss, forecasting metrics, and optional prediction rows.
+
+    When ``collect_predictions`` is false, this preserves the historical
+    validation contract: scalar validation metrics plus a single sample for
+    plotting. When true, the result also contains a ``predictions`` list with
+    one row per valid forecast hour for CSV logging and diagnostic plots.
+    Extra keyword arguments are accepted for backwards-compatible integration
+    with training scripts that may pass optional validation controls.
+    """
     model.eval()
     total_loss = 0.0
     total_valid_positions = 0
