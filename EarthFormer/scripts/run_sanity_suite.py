@@ -50,6 +50,8 @@ def common_child_args(config: TrainingConfig) -> list[str]:
     for value, flag in (
         (config.dataset_root, "--dataset-root"),
         (config.metadata_filename, "--metadata-filename"),
+        (config.hourly_csv, "--hourly-csv"),
+        (config.elevation_csv, "--elevation-csv"),
         (config.batch_size, "--batch-size"),
         (config.learning_rate, "--learning-rate"),
         (config.weight_decay, "--weight-decay"),

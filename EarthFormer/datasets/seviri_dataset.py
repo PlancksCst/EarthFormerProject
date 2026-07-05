@@ -31,6 +31,8 @@ def build_dataset(config: TrainingConfig, split: str, include_target: bool) -> S
         include_target=include_target,
         target_channel_index=config.target_channel_index,
         metadata_filename=config.metadata_filename,
+        hourly_csv=str(config.hourly_csv),
+        elevation_csv=str(config.elevation_csv),
     )
 
 

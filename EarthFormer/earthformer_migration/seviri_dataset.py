@@ -90,6 +90,8 @@ class SEVIRIImageSequenceDataset(Dataset):
         include_target: bool = False,
         target_channel_index: int = 0,
         metadata_filename: str | None = None,
+        hourly_csv: str | None = None,
+        elevation_csv: str | None = None,
     ) -> None:
         self.dataset_root = os.path.abspath(dataset_root)
         self.split = split
@@ -100,6 +102,8 @@ class SEVIRIImageSequenceDataset(Dataset):
         self.normalize = normalize
         self.include_target = include_target
         self.target_channel_index = target_channel_index
+        self.hourly_csv = hourly_csv
+        self.elevation_csv = elevation_csv
 
         metadata_path = self._resolve_metadata_path(metadata_filename)
         norm_path = os.path.join(self.dataset_root, "normalization.json")
@@ -138,6 +142,11 @@ class SEVIRIImageSequenceDataset(Dataset):
             )
 
         self._zarr_cache: dict[str, Any] = {}
+        self.hourly_df: pd.DataFrame | None = None
+        self.elevation_df: pd.DataFrame | None = None
+        if self.include_target:
+            self.hourly_df = self._load_hourly_dataframe(hourly_csv)
+            self.elevation_df = self._load_elevation_dataframe(elevation_csv)
 
     def __len__(self) -> int:
         return len(self.meta)
@@ -179,6 +188,90 @@ class SEVIRIImageSequenceDataset(Dataset):
             if os.path.exists(basename_joined):
                 return basename_joined
         return path
+
+    def _resolve_csv_path(
+        self,
+        path: str | None,
+        filename: str,
+        required: bool,
+    ) -> str | None:
+        """Resolve a CSV path from explicit, dataset-local, Colab, or local layouts."""
+        candidates: list[str] = []
+        if path:
+            candidates.append(os.fspath(path))
+        candidates.extend(
+            [
+                os.path.join(self.dataset_root, filename),
+                os.path.join(os.path.dirname(self.dataset_root), filename),
+                os.path.join("/content/CAMS", filename),
+                os.path.join("/content/datasets", filename),
+                os.path.join("/content/drive/MyDrive/EarthFormer/CAMS", filename),
+                os.path.abspath(
+                    os.path.join(
+                        os.path.dirname(__file__),
+                        "..",
+                        "..",
+                        "..",
+                        "CAMS",
+                        filename,
+                    )
+                ),
+                os.path.abspath(
+                    os.path.join(
+                        os.path.dirname(__file__),
+                        "..",
+                        "..",
+                        "..",
+                        "..",
+                        "CAMS",
+                        filename,
+                    )
+                ),
+            ]
+        )
+
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        if required:
+            tried = ", ".join(candidates)
+            raise FileNotFoundError(f"Could not find {filename}. Tried: {tried}")
+        return None
+
+    def _load_hourly_dataframe(self, path: str | None) -> pd.DataFrame:
+        """Load the hourly CAMS/ground CSI-GHI dataframe indexed by timestamp."""
+        csv_path = self._resolve_csv_path(
+            path=path,
+            filename="all_locations_hourly.csv",
+            required=True,
+        )
+        assert csv_path is not None
+        df = pd.read_csv(csv_path)
+        if "timestamp" not in df.columns:
+            raise KeyError(f"Missing 'timestamp' column in {csv_path}")
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("timestamp").sort_index()
+        if not df.index.is_unique:
+            df = df[~df.index.duplicated(keep="first")]
+        return df
+
+    def _load_elevation_dataframe(self, path: str | None) -> pd.DataFrame | None:
+        """Load the optional elevation CSV for future feature integration."""
+        csv_path = self._resolve_csv_path(
+            path=path,
+            filename="all_locations_elevation.csv",
+            required=False,
+        )
+        if csv_path is None:
+            return None
+        df = pd.read_csv(csv_path)
+        if "timestamp" not in df.columns:
+            raise KeyError(f"Missing 'timestamp' column in {csv_path}")
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df = df.set_index("timestamp").sort_index()
+        if not df.index.is_unique:
+            df = df[~df.index.duplicated(keep="first")]
+        return df
 
     def _get_zarr(self, path: str) -> Any:
         if path not in self._zarr_cache:
@@ -239,6 +332,31 @@ class SEVIRIImageSequenceDataset(Dataset):
         elif parsed.size > self.sequence_length:
             parsed = parsed[: self.sequence_length]
         return parsed.astype(np.bool_)
+
+    def _indices_from_row(
+        self,
+        row: pd.Series,
+        sequence_column: str,
+        start_column: str,
+        end_column: str,
+        length: int,
+    ) -> np.ndarray:
+        """Read frame indices from either sequence or start/end metadata."""
+        if sequence_column in row.index:
+            return self._parse_sequence(row[sequence_column], length=length)
+        if start_column in row.index and end_column in row.index:
+            start = int(row[start_column])
+            end = int(row[end_column])
+            if end < start:
+                parsed = np.array([], dtype=np.int64)
+            else:
+                parsed = np.arange(start, end + 1, dtype=np.int64)
+            if parsed.size < length:
+                parsed = np.pad(parsed, (0, length - parsed.size), constant_values=-1)
+            elif parsed.size > length:
+                parsed = parsed[:length]
+            return parsed.astype(np.int64)
+        return np.full(length, -1, dtype=np.int64)
 
     def _find_column(self, row: pd.Series, candidates: tuple[str, ...]) -> str | None:
         """Return the first matching column, allowing case-insensitive matches."""
@@ -374,8 +492,181 @@ class SEVIRIImageSequenceDataset(Dataset):
             return self._parse_float_sequence(row[column], self.output_length, column)
         return self._parse_prefixed_float_columns(row, prefixes, "target GHI")
 
+    def _metadata_contains_forecasting_targets(self, row: pd.Series) -> bool:
+        """Return whether target sequences are embedded directly in metadata."""
+        return (
+            self._find_column(row, self.CSI_TARGET_COLUMNS) is not None
+            or self._parse_prefixed_float_columns(
+                row,
+                self.CSI_TARGET_PREFIXES,
+                "target CSI",
+            )
+            is not None
+        )
+
+    def _location_columns(self, location: str) -> dict[str, str]:
+        """Return hourly CSV column names for one location."""
+        columns = {
+            "csi": f"CSI_{location}",
+            "ghi": f"GHI_{location}",
+            "clear": f"GHI_clear_{location}",
+        }
+        if self.hourly_df is None:
+            raise RuntimeError("Hourly CSV dataframe is not loaded")
+        missing = [column for column in columns.values() if column not in self.hourly_df.columns]
+        if missing:
+            available = ", ".join(self.hourly_df.columns)
+            raise KeyError(
+                f"Missing hourly CSV columns for location={location!r}: {missing}. "
+                f"Available columns: {available}"
+            )
+        return columns
+
+    def _get_hourly_row(self, timestamp: pd.Timestamp) -> pd.Series | None:
+        """Return one hourly CSV row for a timestamp, or None if absent."""
+        if self.hourly_df is None:
+            raise RuntimeError("Hourly CSV dataframe is not loaded")
+        try:
+            row = self.hourly_df.loc[timestamp]
+        except KeyError:
+            return None
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        return row
+
+    def _get_hourly_value(
+        self,
+        location_columns: dict[str, str],
+        timestamp: pd.Timestamp,
+        key: str,
+    ) -> float | None:
+        """Return one finite value from the hourly CSV."""
+        row = self._get_hourly_row(timestamp)
+        if row is None:
+            return None
+        value = row[location_columns[key]]
+        if pd.isna(value):
+            return None
+        value = float(value)
+        if not np.isfinite(value):
+            return None
+        return value
+
+    def _persistence_impute_csi(
+        self,
+        location_columns: dict[str, str],
+        timestamp: pd.Timestamp,
+    ) -> float | None:
+        """Use previous-day CSI when the target timestamp is missing."""
+        return self._get_hourly_value(
+            location_columns,
+            timestamp - pd.Timedelta(days=1),
+            "csi",
+        )
+
+    def _interpolate_csi(
+        self,
+        timestamps: list[pd.Timestamp],
+        values: np.ndarray,
+    ) -> np.ndarray:
+        """Linearly interpolate missing CSI values within one daylight sequence."""
+        values = np.asarray(values, dtype=np.float32)
+        if not np.isnan(values).any():
+            return values
+
+        valid_positions = np.where(~np.isnan(values))[0]
+        if valid_positions.size == 0:
+            return values
+
+        for pos in np.where(np.isnan(values))[0]:
+            left = valid_positions[valid_positions < pos]
+            right = valid_positions[valid_positions > pos]
+            if left.size and right.size:
+                left_pos = left[-1]
+                right_pos = right[0]
+                left_hour = float(timestamps[left_pos].hour)
+                right_hour = float(timestamps[right_pos].hour)
+                if right_hour == left_hour:
+                    values[pos] = values[left_pos]
+                else:
+                    values[pos] = np.interp(
+                        float(timestamps[pos].hour),
+                        [left_hour, right_hour],
+                        [values[left_pos], values[right_pos]],
+                    )
+        return values
+
+    def _load_forecasting_targets_from_csv(self, row: pd.Series) -> dict[str, torch.Tensor]:
+        """Load target CSI, target GHI, and clear-sky GHI from the hourly CSV."""
+        location = str(row.location)
+        columns = self._location_columns(location)
+        target_day = pd.Timestamp(row.target_day)
+        target_mask = (
+            self._parse_mask(row["target_mask"])
+            if "target_mask" in row.index
+            else np.zeros(self.output_length, dtype=np.bool_)
+        )
+        timestamps = [
+            target_day + pd.Timedelta(hours=4 + pos)
+            for pos in range(self.output_length)
+        ]
+
+        target_csi = np.full(self.output_length, np.nan, dtype=np.float32)
+        target_ghi = np.zeros(self.output_length, dtype=np.float32)
+        clear_sky_ghi = np.zeros(self.output_length, dtype=np.float32)
+
+        for pos, timestamp in enumerate(timestamps):
+            if target_mask[pos]:
+                continue
+            csi_value = self._get_hourly_value(columns, timestamp, "csi")
+            ghi_value = self._get_hourly_value(columns, timestamp, "ghi")
+            clear_value = self._get_hourly_value(columns, timestamp, "clear")
+            if csi_value is not None:
+                target_csi[pos] = csi_value
+            if ghi_value is not None:
+                target_ghi[pos] = ghi_value
+            if clear_value is not None:
+                clear_sky_ghi[pos] = clear_value
+
+        for pos in np.where(np.isnan(target_csi))[0]:
+            value = self._persistence_impute_csi(columns, timestamps[pos])
+            if value is not None:
+                target_csi[pos] = value
+
+        target_csi = self._interpolate_csi(timestamps, target_csi)
+        target_csi[np.isnan(target_csi)] = 0.0
+
+        missing_ghi = target_ghi == 0.0
+        target_ghi[missing_ghi] = target_csi[missing_ghi] * clear_sky_ghi[missing_ghi]
+
+        if not np.isfinite(target_csi).all():
+            raise RuntimeError(
+                f"Non-finite CSI target for location={location} target_day={row.target_day}"
+            )
+        if not np.isfinite(target_ghi).all():
+            raise RuntimeError(
+                f"Non-finite target GHI for location={location} target_day={row.target_day}"
+            )
+        if not np.isfinite(clear_sky_ghi).all():
+            raise RuntimeError(
+                f"Non-finite clear-sky GHI for location={location} target_day={row.target_day}"
+            )
+
+        return {
+            "target": torch.from_numpy(target_csi.astype(np.float32)),
+            "target_csi": torch.from_numpy(target_csi.astype(np.float32)),
+            "clear_sky_ghi": torch.from_numpy(clear_sky_ghi.astype(np.float32)),
+            "clear_ghi": torch.from_numpy(clear_sky_ghi.astype(np.float32)),
+            "target_ghi": torch.from_numpy(target_ghi.astype(np.float32)),
+            "target_timestamp": [str(timestamp) for timestamp in timestamps],
+            "target_mask": torch.tensor(target_mask, dtype=torch.bool),
+        }
+
     def _load_forecasting_targets(self, row: pd.Series) -> dict[str, torch.Tensor]:
         """Return CSI target and clear-sky GHI tensors for one sample."""
+        if not self._metadata_contains_forecasting_targets(row):
+            return self._load_forecasting_targets_from_csv(row)
+
         target_csi = self._load_required_sequence(
             row=row,
             candidates=self.CSI_TARGET_COLUMNS,
@@ -406,8 +697,18 @@ class SEVIRIImageSequenceDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.meta.iloc[index]
-        input_indices = self._parse_sequence(row.input_indices)
-        image_mask = self._parse_mask(row.image_mask)
+        input_indices = self._indices_from_row(
+            row,
+            sequence_column="input_indices",
+            start_column="input_start",
+            end_column="input_end",
+            length=self.sequence_length,
+        )
+        image_mask = (
+            self._parse_mask(row["image_mask"])
+            if "image_mask" in row.index
+            else np.zeros(self.sequence_length, dtype=np.bool_)
+        )
 
         input_zarr = self._get_zarr(row.input_zarr)
         if "X" not in input_zarr:
@@ -418,7 +719,7 @@ class SEVIRIImageSequenceDataset(Dataset):
         item = {
             "satellite": torch.from_numpy(satellite),
             "image_mask": torch.tensor(image_mask, dtype=torch.bool),
-            "sample_id": int(row.sample_id),
+            "sample_id": int(row.sample_id) if "sample_id" in row.index else int(index),
             "location": str(row.location),
             "input_day": str(row.input_day),
             "target_day": str(row.target_day),

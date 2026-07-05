@@ -79,12 +79,48 @@ def discover_output_dir() -> Path:
     return project_root() / "outputs"
 
 
+def discover_cams_csv(filename: str, env_name: str) -> Path:
+    """Discover a CAMS CSV file across local, Colab, and dataset-mounted layouts."""
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return Path(env_value)
+
+    root = project_root()
+    candidates = [
+        Path("/content/CAMS") / filename,
+        Path("/content/datasets") / filename,
+        Path("/content/drive/MyDrive/EarthFormer/CAMS") / filename,
+        root.parents[2] / "CAMS" / filename,
+        root.parent / "CAMS" / filename,
+        root / "data" / filename,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return root.parents[2] / "CAMS" / filename
+
+
+def discover_hourly_csv() -> Path:
+    """Discover the hourly CAMS/ground CSI-GHI CSV."""
+    return discover_cams_csv("all_locations_hourly.csv", "EARTHFORMER_HOURLY_CSV")
+
+
+def discover_elevation_csv() -> Path:
+    """Discover the hourly solar-elevation CSV."""
+    return discover_cams_csv(
+        "all_locations_elevation.csv",
+        "EARTHFORMER_ELEVATION_CSV",
+    )
+
+
 @dataclass
 class TrainingConfig:
     """Runtime configuration for backbone fine-tuning."""
 
     dataset_root: Path = field(default_factory=discover_dataset_root)
     metadata_filename: str | None = os.environ.get("EARTHFORMER_METADATA_FILE")
+    hourly_csv: Path = field(default_factory=discover_hourly_csv)
+    elevation_csv: Path = field(default_factory=discover_elevation_csv)
     batch_size: int = int(os.environ.get("EARTHFORMER_BATCH_SIZE", "8"))
     learning_rate: float = float(os.environ.get("EARTHFORMER_LR", "1e-4"))
     weight_decay: float = float(os.environ.get("EARTHFORMER_WEIGHT_DECAY", "1e-4"))
@@ -141,6 +177,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fine-tune EarthFormer on SEVIRI imagery.")
     parser.add_argument("--dataset-root", type=Path, default=None)
     parser.add_argument("--metadata-filename", type=str, default=None)
+    parser.add_argument("--hourly-csv", type=Path, default=None)
+    parser.add_argument("--elevation-csv", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
@@ -180,6 +218,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
     overrides = {
         "dataset_root": args.dataset_root,
         "metadata_filename": args.metadata_filename,
+        "hourly_csv": args.hourly_csv,
+        "elevation_csv": args.elevation_csv,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
