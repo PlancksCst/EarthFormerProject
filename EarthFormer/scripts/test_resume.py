@@ -9,6 +9,7 @@ try:
     from .diagnostic_utils import (
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -27,6 +28,7 @@ except ImportError:
     from diagnostic_utils import (  # type: ignore
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -89,6 +91,7 @@ def main() -> None:
     config = prepare_config(config_from_args(args))
     device = resolve_device(config)
     amp_enabled = use_amp(config, device)
+    amp_dtype = autocast_dtype(config, device)
     timer = Timer()
 
     batch = load_batch(config=config, split=args.split, device=device, include_target=False)
@@ -98,7 +101,7 @@ def main() -> None:
     model = build_model(config, device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, epochs=args.steps_before_save + args.steps_after_resume + 1)
-    scaler = build_scaler(amp_enabled)
+    scaler = build_scaler(amp_enabled, amp_dtype)
 
     pre_save_loss = float("inf")
     for _step in range(args.steps_before_save):
@@ -111,6 +114,7 @@ def main() -> None:
             config=config,
             device=device,
             amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
         pre_save_loss = step_report["loss"]
         scheduler.step()
@@ -136,7 +140,7 @@ def main() -> None:
         resumed_optimizer,
         epochs=args.steps_before_save + args.steps_after_resume + 1,
     )
-    resumed_scaler = build_scaler(amp_enabled)
+    resumed_scaler = build_scaler(amp_enabled, amp_dtype)
     next_epoch, best_loss = resume_checkpoint(
         path=checkpoint_path,
         model=resumed_model,
@@ -162,6 +166,7 @@ def main() -> None:
             config=config,
             device=device,
             amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
         )
         post_resume_loss = resumed_step["loss"]
         post_resume_gradient_norm = resumed_step["gradient_summary"]["total_norm"]

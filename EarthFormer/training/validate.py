@@ -10,9 +10,18 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 try:
+    from training.debugging import assert_finite, assert_scalar_finite
+    from training.losses import valid_mask_from_target_mask
+except ImportError:
+    from EarthFormer.training.debugging import assert_finite, assert_scalar_finite  # type: ignore
+    from EarthFormer.training.losses import valid_mask_from_target_mask  # type: ignore
+
+try:
     from utils.metrics import forecast_metrics
+    from utils.precision import autocast_context
 except ImportError:
     from EarthFormer.utils.metrics import forecast_metrics  # type: ignore
+    from EarthFormer.utils.precision import autocast_context  # type: ignore
 
 
 def ensure_forecast_target(target: torch.Tensor, name: str = "target") -> torch.Tensor:
@@ -43,14 +52,15 @@ def _first_metadata_value(batch: dict[str, Any], key: str) -> Any:
 def validate(
     model: nn.Module,
     dataloader: DataLoader,
-    criterion: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    criterion: Callable[..., torch.Tensor],
     device: torch.device,
     use_amp: bool = False,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Return validation loss, CSI metrics, GHI metrics, and one plot sample."""
     model.eval()
     total_loss = 0.0
-    total_samples = 0
+    total_valid_positions = 0
     amp_enabled = use_amp and device.type == "cuda"
     csi_predictions: list[torch.Tensor] = []
     csi_targets: list[torch.Tensor] = []
@@ -58,7 +68,7 @@ def validate(
     ghi_targets: list[torch.Tensor] = []
     sample: dict[str, Any] | None = None
 
-    for batch in dataloader:
+    for batch_index, batch in enumerate(dataloader):
         inputs = batch["satellite"].to(device, non_blocking=True)
         targets = ensure_forecast_target(batch["target"], "target").to(
             device,
@@ -76,25 +86,69 @@ def validate(
                 device,
                 non_blocking=True,
             )
+        target_mask = batch.get("target_mask")
+        if isinstance(target_mask, torch.Tensor):
+            target_mask = target_mask.to(device, non_blocking=True)
+            assert_finite(
+                "target_mask",
+                target_mask.float(),
+                batch=batch,
+                batch_index=batch_index,
+            )
+        valid_mask = valid_mask_from_target_mask(target_mask, targets)
+        valid_count = int(valid_mask.sum().detach().cpu())
+        if valid_count == 0:
+            raise RuntimeError(
+                "No valid target positions in validation batch. "
+                "Mask convention is target_mask=0 valid, target_mask=1 invalid."
+            )
 
-        with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+        assert_finite("inputs", inputs, batch=batch, batch_index=batch_index)
+        assert_finite("targets", targets, batch=batch, batch_index=batch_index)
+        assert_finite(
+            "clear_sky_ghi",
+            clear_sky_ghi,
+            batch=batch,
+            batch_index=batch_index,
+        )
+        assert_finite(
+            "target_ghi",
+            target_ghi_tensor,
+            batch=batch,
+            batch_index=batch_index,
+        )
+
+        with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
             predictions = model(inputs)
             if predictions.shape != targets.shape:
                 raise ValueError(
                     "Prediction and target shapes differ: "
                     f"{tuple(predictions.shape)} vs {tuple(targets.shape)}"
                 )
-            loss = criterion(predictions, targets)
+            assert_finite(
+                "predictions",
+                predictions,
+                batch=batch,
+                batch_index=batch_index,
+            )
+            loss = criterion(predictions, targets, valid_mask=valid_mask)
+            assert_scalar_finite("loss", loss, batch=batch, batch_index=batch_index)
 
         prediction_ghi = reconstruct_ghi(predictions, clear_sky_ghi)
-        batch_size = inputs.shape[0]
-        total_loss += float(loss.item()) * batch_size
-        total_samples += batch_size
+        assert_finite(
+            "predicted_ghi",
+            prediction_ghi,
+            batch=batch,
+            batch_index=batch_index,
+        )
+        total_loss += float(loss.item()) * valid_count
+        total_valid_positions += valid_count
 
-        csi_predictions.append(predictions.detach().cpu())
-        csi_targets.append(targets.detach().cpu())
-        ghi_predictions.append(prediction_ghi.detach().cpu())
-        ghi_targets.append(target_ghi_tensor.detach().cpu())
+        valid_mask_cpu = valid_mask.detach().cpu()
+        csi_predictions.append(predictions.detach().cpu()[valid_mask_cpu])
+        csi_targets.append(targets.detach().cpu()[valid_mask_cpu])
+        ghi_predictions.append(prediction_ghi.detach().cpu()[valid_mask_cpu])
+        ghi_targets.append(target_ghi_tensor.detach().cpu()[valid_mask_cpu])
 
         if sample is None:
             sample = {
@@ -109,7 +163,7 @@ def validate(
                 "target_day": _first_metadata_value(batch, "target_day"),
             }
 
-    if total_samples == 0:
+    if total_valid_positions == 0:
         raise ValueError("Validation dataloader produced no samples")
 
     all_csi_predictions = torch.cat(csi_predictions, dim=0)
@@ -117,7 +171,7 @@ def validate(
     all_ghi_predictions = torch.cat(ghi_predictions, dim=0)
     all_ghi_targets = torch.cat(ghi_targets, dim=0)
 
-    metrics: dict[str, Any] = {"val_loss": total_loss / total_samples}
+    metrics: dict[str, Any] = {"val_loss": total_loss / total_valid_positions}
     metrics.update(forecast_metrics(all_csi_predictions, all_csi_targets, prefix="CSI"))
     metrics.update(forecast_metrics(all_ghi_predictions, all_ghi_targets, prefix="GHI"))
     metrics["sample"] = sample

@@ -132,7 +132,8 @@ class TrainingConfig:
     pretrained_checkpoint: Path | None = None
     resume_checkpoint: Path | None = None
     random_seed: int = int(os.environ.get("EARTHFORMER_SEED", "42"))
-    mixed_precision: bool = os.environ.get("EARTHFORMER_MIXED_PRECISION", "1") != "0"
+    mixed_precision: bool = os.environ.get("EARTHFORMER_MIXED_PRECISION", "0") == "1"
+    amp_dtype: str = os.environ.get("EARTHFORMER_AMP_DTYPE", "bf16")
     gradient_clip: float = float(os.environ.get("EARTHFORMER_GRADIENT_CLIP", "1.0"))
     scheduler_t_max: int | None = None
     scheduler_eta_min: float = float(os.environ.get("EARTHFORMER_ETA_MIN", "1e-6"))
@@ -190,6 +191,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default=None)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--gradient-clip", type=float, default=None)
     parser.add_argument("--scheduler-t-max", type=int, default=None)
@@ -231,6 +234,7 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "pretrained_checkpoint": args.pretrained_checkpoint,
         "resume_checkpoint": args.resume_checkpoint,
         "random_seed": args.seed,
+        "amp_dtype": args.amp_dtype,
         "gradient_clip": args.gradient_clip,
         "scheduler_t_max": args.scheduler_t_max,
         "scheduler_eta_min": args.scheduler_eta_min,
@@ -248,6 +252,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
     for key, value in overrides.items():
         if value is not None:
             setattr(cfg, key, value)
+    if args.amp:
+        cfg.mixed_precision = True
     if args.no_amp:
         cfg.mixed_precision = False
     if args.no_normalize:

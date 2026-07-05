@@ -63,6 +63,7 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         (config.pretrained_checkpoint, "--pretrained-checkpoint"),
         (config.resume_checkpoint, "--resume-checkpoint"),
         (config.random_seed, "--seed"),
+        (config.amp_dtype, "--amp-dtype"),
         (config.gradient_clip, "--gradient-clip"),
         (config.scheduler_t_max, "--scheduler-t-max"),
         (config.scheduler_eta_min, "--scheduler-eta-min"),
@@ -78,7 +79,9 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         (config.regression_hidden_dim, "--regression-hidden-dim"),
     ):
         forwarded.extend(optional_value_arg(value, flag))
-    if not config.mixed_precision:
+    if config.mixed_precision:
+        forwarded.append("--amp")
+    else:
         forwarded.append("--no-amp")
     if not config.normalize:
         forwarded.append("--no-normalize")

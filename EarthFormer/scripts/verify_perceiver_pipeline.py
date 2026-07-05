@@ -10,6 +10,7 @@ try:
     from .diagnostic_utils import (
         Timer,
         attention_tensors,
+        autocast_dtype,
         build_model,
         forward_debug,
         load_batch,
@@ -24,6 +25,7 @@ except ImportError:
     from diagnostic_utils import (  # type: ignore
         Timer,
         attention_tensors,
+        autocast_dtype,
         build_model,
         forward_debug,
         load_batch,
@@ -53,6 +55,7 @@ def main() -> None:
     config = prepare_config(config_from_args(args))
     device = resolve_device(config)
     amp_enabled = use_amp(config, device)
+    amp_dtype = autocast_dtype(config, device)
     timer = Timer()
 
     batch = load_batch(config=config, split=args.split, device=device, include_target=False)
@@ -61,7 +64,13 @@ def main() -> None:
     model.eval()
 
     with torch.no_grad():
-        result = forward_debug(model, inputs, device=device, amp_enabled=amp_enabled)
+        result = forward_debug(
+            model,
+            inputs,
+            device=device,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
         attention = attention_tensors(model, result["pre_head_latent"])
 
     readout = result["readout"]

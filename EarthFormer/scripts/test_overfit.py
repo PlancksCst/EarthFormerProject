@@ -6,6 +6,7 @@ try:
     from .diagnostic_utils import (
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -24,6 +25,7 @@ except ImportError:
     from diagnostic_utils import (  # type: ignore
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -57,13 +59,14 @@ def main() -> None:
     config = prepare_config(config_from_args(args))
     device = resolve_device(config)
     amp_enabled = use_amp(config, device)
+    amp_dtype = autocast_dtype(config, device)
     timer = Timer()
 
     loader = tiny_dataloader(config=config, split=args.split, samples=args.samples)
     model = build_model(config, device)
     optimizer = build_optimizer(config, model)
     scheduler = build_scheduler(config, optimizer, epochs=args.max_epochs)
-    scaler = build_scaler(amp_enabled)
+    scaler = build_scaler(amp_enabled, amp_dtype)
 
     epoch_rows: list[dict[str, float | int | str]] = []
     passed = False
@@ -97,6 +100,7 @@ def main() -> None:
                 config=config,
                 device=device,
                 amp_enabled=amp_enabled,
+                amp_dtype=amp_dtype,
             )
             batch_size = inputs.shape[0]
             total_loss += step["loss"] * batch_size

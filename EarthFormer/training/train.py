@@ -23,10 +23,17 @@ from configs.config import TrainingConfig, build_arg_parser, config_from_args  #
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import resume_checkpoint, save_checkpoint  # noqa: E402
+from training.debugging import (  # noqa: E402
+    assert_finite,
+    assert_gradients_finite,
+    assert_scalar_finite,
+)
 from training.losses import MSELoss  # noqa: E402
-from training.validate import ensure_forecast_target, validate  # noqa: E402
+from training.losses import valid_mask_from_target_mask  # noqa: E402
+from training.validate import ensure_forecast_target, reconstruct_ghi, validate  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
 from utils.plotting import save_training_plots  # noqa: E402
+from utils.precision import autocast_context, build_grad_scaler, resolve_amp_dtype  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
 
 
@@ -43,6 +50,11 @@ class EarthFormerTrainer:
 
         self.device = torch.device(self.config.resolved_device())
         self.use_amp = self.config.mixed_precision and self.device.type == "cuda"
+        self.amp_dtype = (
+            resolve_amp_dtype(self.config.amp_dtype, self.device)
+            if self.use_amp
+            else None
+        )
 
         self.train_loader = build_dataloader(
             config=self.config,
@@ -70,13 +82,7 @@ class EarthFormerTrainer:
             T_max=max(1, t_max),
             eta_min=self.config.scheduler_eta_min,
         )
-        # Use a reduced initial scale to reduce risk of FP16 overflow/NaN
-        # when training with mixed precision on some GPUs.
-        try:
-            self.scaler = torch.amp.GradScaler(enabled=self.use_amp, init_scale=2.0 ** 8)
-        except TypeError:
-            # Older PyTorch versions may not accept init_scale kwarg.
-            self.scaler = torch.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = build_grad_scaler(enabled=self.use_amp, dtype=self.amp_dtype)
         self.logger = CSVLogger(self.config.output_dir / self.config.log_filename)
         self.history: list[dict[str, float]] = []
         self.start_epoch = 1
@@ -100,41 +106,118 @@ class EarthFormerTrainer:
         """Run one training epoch and return average training loss."""
         self.model.train()
         total_loss = 0.0
-        total_samples = 0
+        total_valid_positions = 0
         progress = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.epochs}", leave=False)
 
-        for batch in progress:
+        for batch_index, batch in enumerate(progress):
             inputs = batch["satellite"].to(self.device, non_blocking=True)
             targets = ensure_forecast_target(batch["target"]).to(
                 self.device,
                 non_blocking=True,
             )
+            clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(
+                self.device,
+                non_blocking=True,
+            )
+            target_mask = batch.get("target_mask")
+            if isinstance(target_mask, torch.Tensor):
+                target_mask = target_mask.to(self.device, non_blocking=True)
+                assert_finite(
+                    "target_mask",
+                    target_mask.float(),
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+            valid_mask = valid_mask_from_target_mask(target_mask, targets)
+            valid_count = int(valid_mask.sum().detach().cpu())
+            if valid_count == 0:
+                raise RuntimeError(
+                    "No valid target positions in training batch. "
+                    "Mask convention is target_mask=0 valid, target_mask=1 invalid."
+                )
+            assert_finite("inputs", inputs, batch=batch, batch_index=batch_index)
+            assert_finite("targets", targets, batch=batch, batch_index=batch_index)
+            assert_finite(
+                "clear_sky_ghi",
+                clear_sky_ghi,
+                batch=batch,
+                batch_index=batch_index,
+            )
             batch_size = inputs.shape[0]
 
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast(device_type=self.device.type, enabled=self.use_amp):
+            with autocast_context(
+                device=self.device,
+                enabled=self.use_amp,
+                dtype=self.amp_dtype,
+            ):
                 predictions = self.model(inputs)
                 if predictions.shape != targets.shape:
                     raise ValueError(
                         "Prediction and target shapes differ: "
                         f"{tuple(predictions.shape)} vs {tuple(targets.shape)}"
                     )
-                loss = self.criterion(predictions, targets)
+                assert_finite(
+                    "predictions",
+                    predictions,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+                predicted_ghi = reconstruct_ghi(predictions, clear_sky_ghi)
+                assert_finite(
+                    "predicted_ghi",
+                    predicted_ghi,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+                loss = self.criterion(predictions, targets, valid_mask=valid_mask)
+                assert_scalar_finite(
+                    "loss",
+                    loss,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
 
             self.scaler.scale(loss).backward()
             if self.config.gradient_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                gradient_stats = assert_gradients_finite(
+                    self.model,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+                grad_norm = nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.gradient_clip,
+                )
+                if not isinstance(grad_norm, torch.Tensor):
+                    grad_norm = torch.tensor(float(grad_norm), device=self.device)
+                assert_scalar_finite(
+                    "gradient_norm",
+                    grad_norm.detach().reshape(()),
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+            else:
+                gradient_stats = assert_gradients_finite(
+                    self.model,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += float(loss.item()) * batch_size
-            total_samples += batch_size
-            progress.set_postfix(loss=f"{loss.item():.5f}", lr=f"{self.current_lr():.3e}")
+            total_loss += float(loss.item()) * valid_count
+            total_valid_positions += valid_count
+            progress.set_postfix(
+                loss=f"{loss.item():.5f}",
+                grad=f"{float(gradient_stats['total_norm']):.3e}",
+                lr=f"{self.current_lr():.3e}",
+            )
 
-        if total_samples == 0:
+        if total_valid_positions == 0:
             raise ValueError("Training dataloader produced no samples")
-        return total_loss / total_samples
+        return total_loss / total_valid_positions
 
     def save_epoch_checkpoints(self, epoch: int, validation_loss: float) -> None:
         """Save latest and best checkpoints."""
@@ -176,6 +259,7 @@ class EarthFormerTrainer:
                 criterion=self.criterion,
                 device=self.device,
                 use_amp=self.use_amp,
+                amp_dtype=self.amp_dtype,
             )
             validation_loss = float(validation_metrics["val_loss"])
             self.scheduler.step()
@@ -271,9 +355,10 @@ class EarthFormerTrainer:
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(
-            device_type=self.device.type,
-            enabled=self.use_amp
+        with autocast_context(
+            device=self.device,
+            enabled=self.use_amp,
+            dtype=self.amp_dtype,
         ):
             prediction = self.model(inputs)
 
@@ -414,9 +499,10 @@ class EarthFormerTrainer:
 
                 self.optimizer.zero_grad()
 
-                with torch.amp.autocast(
-                    device_type=self.device.type,
+                with autocast_context(
+                    device=self.device,
                     enabled=self.use_amp,
+                    dtype=self.amp_dtype,
                 ):
 
                     prediction = self.model(inputs)
@@ -492,6 +578,7 @@ class EarthFormerTrainer:
                 criterion=self.criterion,
                 device=self.device,
                 use_amp=self.use_amp,
+                amp_dtype=self.amp_dtype,
             )
             val = float(val_metrics["val_loss"])
 

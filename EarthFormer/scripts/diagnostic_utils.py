@@ -31,6 +31,11 @@ from datasets.seviri_dataset import build_dataloader, build_dataset  # noqa: E40
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.losses import MSELoss  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
+from utils.precision import (  # noqa: E402
+    autocast_context,
+    build_grad_scaler as build_precision_grad_scaler,
+    resolve_amp_dtype,
+)
 
 
 def now_utc() -> str:
@@ -98,6 +103,11 @@ def use_amp(config: TrainingConfig, device: torch.device) -> bool:
     return bool(config.mixed_precision and device.type == "cuda")
 
 
+def autocast_dtype(config: TrainingConfig, device: torch.device) -> torch.dtype | None:
+    """Return the configured autocast dtype when AMP is enabled."""
+    return resolve_amp_dtype(config.amp_dtype, device) if use_amp(config, device) else None
+
+
 def prepare_config(config: TrainingConfig) -> TrainingConfig:
     """Seed and create output directories."""
     config.prepare_directories()
@@ -157,9 +167,10 @@ def forward_debug(
     inputs: torch.Tensor,
     device: torch.device,
     amp_enabled: bool,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Run a debug forward pass through the complete forecasting model."""
-    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+    with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
         return model(inputs, return_debug=True)
 
 
@@ -278,12 +289,12 @@ def build_scheduler(
     )
 
 
-def build_scaler(enabled: bool) -> torch.amp.GradScaler:
+def build_scaler(
+    enabled: bool,
+    amp_dtype: torch.dtype | None = None,
+) -> torch.amp.GradScaler:
     """Build an AMP GradScaler across PyTorch versions."""
-    try:
-        return torch.amp.GradScaler(enabled=enabled, init_scale=2.0**8)
-    except TypeError:
-        return torch.amp.GradScaler(enabled=enabled)
+    return build_precision_grad_scaler(enabled=enabled, dtype=amp_dtype)
 
 
 def gradient_summary(model: nn.Module) -> dict[str, Any]:
@@ -364,12 +375,13 @@ def train_one_batch(
     config: TrainingConfig,
     device: torch.device,
     amp_enabled: bool,
+    amp_dtype: torch.dtype | None = None,
 ) -> dict[str, Any]:
     """Run one train step and return diagnostics."""
     model.train()
     criterion = MSELoss()
     optimizer.zero_grad(set_to_none=True)
-    with torch.amp.autocast(device_type=device.type, enabled=amp_enabled):
+    with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
         prediction = model(inputs)
         loss = criterion(prediction, target)
 

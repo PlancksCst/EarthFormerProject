@@ -6,6 +6,7 @@ try:
     from .diagnostic_utils import (
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -25,6 +26,7 @@ except ImportError:
     from diagnostic_utils import (  # type: ignore
         Timer,
         append_csv_row,
+        autocast_dtype,
         build_model,
         build_optimizer,
         build_scaler,
@@ -56,6 +58,7 @@ def main() -> None:
     config = prepare_config(config_from_args(args))
     device = resolve_device(config)
     amp_enabled = use_amp(config, device)
+    amp_dtype = autocast_dtype(config, device)
     timer = Timer()
 
     batch = load_batch(config=config, split=args.split, device=device, include_target=False)
@@ -64,7 +67,7 @@ def main() -> None:
 
     model = build_model(config, device)
     optimizer = build_optimizer(config, model)
-    scaler = build_scaler(amp_enabled)
+    scaler = build_scaler(amp_enabled, amp_dtype)
     before = capture_trainable_parameters(model)
 
     step = train_one_batch(
@@ -76,6 +79,7 @@ def main() -> None:
         config=config,
         device=device,
         amp_enabled=amp_enabled,
+        amp_dtype=amp_dtype,
     )
     update_report = count_updated_parameters(before, model)
     pass_status = all(

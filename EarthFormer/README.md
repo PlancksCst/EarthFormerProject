@@ -29,6 +29,7 @@ EarthFormer/
     train.py
     validate.py
     checkpoint.py
+    debugging.py
     losses.py
   scripts/
     diagnostic_utils.py
@@ -38,6 +39,7 @@ EarthFormer/
     inspect_perceiver.py
     check_attention.py
     test_one_batch.py
+    test_real_batch.py
     test_overfit.py
     test_resume.py
     run_sanity_suite.py
@@ -49,6 +51,7 @@ EarthFormer/
     logger.py
     metrics.py
     plotting.py
+    precision.py
     seed.py
   outputs/
   checkpoints/
@@ -150,7 +153,9 @@ The training loop includes:
 - `DataLoader`
 - AdamW optimizer
 - cosine scheduler
-- automatic mixed precision on CUDA
+- full-precision CUDA/CPU training by default
+- optional CUDA mixed precision with `--amp` or `EARTHFORMER_MIXED_PRECISION=1`
+- BF16 autocast by default when AMP is enabled; FP16 requires `--amp-dtype fp16`
 - gradient clipping
 - validation every epoch
 - `tqdm` progress bar
