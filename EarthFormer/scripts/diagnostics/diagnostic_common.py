@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import sys
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ def add_common_diagnostic_args(parser: argparse.ArgumentParser) -> argparse.Argu
     parser.add_argument("--split", default="val")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--noise-std", type=float, default=0.05)
+    parser.add_argument("--solar-elevation-threshold", type=float, default=5.0)
     return parser
 
 
@@ -202,6 +204,117 @@ def valid_mask_tensor(
         clear_sky_ghi=clear_sky_ghi,
         clear_sky_threshold=clear_sky_threshold,
     )
+
+
+@lru_cache(maxsize=4)
+def load_elevation_frame(path: str) -> pd.DataFrame | None:
+    """Load the optional solar-elevation CSV."""
+    csv_path = Path(path)
+    if not csv_path.exists():
+        return None
+    frame = pd.read_csv(csv_path)
+    if "timestamp" not in frame.columns:
+        return None
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"])
+    frame = frame.set_index("timestamp").sort_index()
+    if not frame.index.is_unique:
+        frame = frame[~frame.index.duplicated(keep="first")]
+    return frame
+
+
+def solar_column(frame: pd.DataFrame, location: str) -> str | None:
+    """Return the best solar-elevation column for a location."""
+    candidates = (
+        f"solar_elevation_{location}",
+        f"solar_elev_{location}",
+        f"elevation_{location}",
+        f"{location}_solar_elevation",
+        f"{location}_solar_elev",
+        f"{location}_elevation",
+        f"SolarElevation_{location}",
+        f"Elevation_{location}",
+        "solar_elevation",
+        "solar_elev",
+        "elevation",
+    )
+    exact = set(frame.columns)
+    lowered = {str(column).lower(): str(column) for column in frame.columns}
+    for candidate in candidates:
+        if candidate in exact:
+            return candidate
+        match = lowered.get(candidate.lower())
+        if match is not None:
+            return match
+    return None
+
+
+def solar_elevation_for_batch(
+    config: Any,
+    batch: dict[str, Any],
+    device: torch.device,
+    horizon: int,
+) -> torch.Tensor | None:
+    """Return `(B,T)` solar elevation from the configured CSV when available."""
+    elevation_path = getattr(config, "elevation_csv", None)
+    if elevation_path is None:
+        return None
+    frame = load_elevation_frame(str(elevation_path))
+    if frame is None:
+        return None
+    locations = batch.get("location")
+    target_days = batch.get("target_day")
+    if locations is None or target_days is None:
+        return None
+    batch_size = len(locations) if isinstance(locations, (list, tuple)) else 1
+    values = np.full((batch_size, horizon), np.nan, dtype=np.float32)
+    any_found = False
+    for sample_index in range(batch_size):
+        location = str(locations[sample_index]) if isinstance(locations, (list, tuple)) else str(locations)
+        target_day = target_days[sample_index] if isinstance(target_days, (list, tuple)) else target_days
+        column = solar_column(frame, location)
+        if column is None:
+            continue
+        try:
+            day = pd.Timestamp(target_day)
+        except Exception:
+            continue
+        for hour in range(horizon):
+            timestamp = day + pd.Timedelta(hours=4 + hour)
+            try:
+                value = frame.loc[timestamp, column]
+            except KeyError:
+                continue
+            if isinstance(value, pd.Series):
+                value = value.iloc[0]
+            if pd.notna(value) and np.isfinite(float(value)):
+                values[sample_index, hour] = float(value)
+                any_found = True
+    if not any_found:
+        return None
+    return torch.as_tensor(values, dtype=torch.float32, device=device)
+
+
+def diagnostic_valid_mask_tensor(
+    config: Any,
+    batch: dict[str, Any],
+    target_csi: torch.Tensor,
+    clear_sky_ghi: torch.Tensor,
+    clear_sky_threshold: float,
+    solar_elevation_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return diagnostic valid mask, using solar elevation when available."""
+    target_mask = batch.get("target_mask")
+    if isinstance(target_mask, torch.Tensor):
+        target_mask = target_mask.to(target_csi.device, non_blocking=True)
+        base_valid = ~target_mask.bool()
+    else:
+        base_valid = torch.ones_like(target_csi, dtype=torch.bool)
+    clear_daylight = torch.isfinite(clear_sky_ghi) & (clear_sky_ghi > float(clear_sky_threshold))
+    solar = solar_elevation_for_batch(config, batch, target_csi.device, target_csi.shape[1])
+    if solar is None:
+        return base_valid & clear_daylight, None
+    solar_daylight = torch.isfinite(solar) & (solar >= float(solar_elevation_threshold))
+    return base_valid & clear_daylight & solar_daylight, solar
 
 
 def batch_prediction_rows(
