@@ -159,6 +159,37 @@ def save_training_plots(
     return paths
 
 
+def save_query_similarity_heatmap(
+    similarity: torch.Tensor,
+    output_dir: str | Path,
+    epoch: int,
+    plot_dir: str | Path | None = None,
+) -> Path:
+    """Save a heatmap of effective Perceiver output-query cosine similarity."""
+    matrix = similarity.detach().float().cpu()
+    target_dir = Path(plot_dir) if plot_dir is not None else plots_dir(output_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    path = target_dir / f"query_similarity_heatmap_epoch_{epoch:03d}.png"
+    values = matrix.numpy()
+    ticks = list(range(1, values.shape[0] + 1))
+
+    fig, ax = plt.subplots(figsize=(7.0, 6.2))
+    image = ax.imshow(values, vmin=-1.0, vmax=1.0, cmap="coolwarm")
+    ax.set_xticks(list(range(values.shape[0])))
+    ax.set_yticks(list(range(values.shape[0])))
+    ax.set_xticklabels(ticks)
+    ax.set_yticklabels(ticks)
+    ax.set_xlabel("Forecast hour query")
+    ax.set_ylabel("Forecast hour query")
+    ax.set_title("Output Query Cosine Similarity")
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("Cosine similarity")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
 def _valid_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in rows if bool(row.get("valid_hour", row.get("valid", True)))]
 

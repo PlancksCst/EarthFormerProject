@@ -4,6 +4,10 @@ from .logger import CSVLogger
 from .metrics import forecast_metrics, mae, nrmse, r2_score, rmse
 from .plotting import save_training_plots
 try:
+    from .plotting import save_query_similarity_heatmap
+except ImportError:
+    save_query_similarity_heatmap = None  # type: ignore[assignment]
+try:
     from .plotting import save_validation_diagnostic_plots
 except ImportError:
     save_validation_diagnostic_plots = None  # type: ignore[assignment]
@@ -24,6 +28,7 @@ __all__ = [
     "r2_score",
     "resolve_amp_dtype",
     "rmse",
+    "save_query_similarity_heatmap",
     "save_training_plots",
     "save_validation_diagnostic_plots",
     "seed_everything",

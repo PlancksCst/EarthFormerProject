@@ -148,6 +148,8 @@ python training/train.py \
   --low-csi-weight 2.0 \
   --low-csi-threshold 0.7 \
   --ghi-loss-weight 0.1 \
+  --use-hour-query-embedding \
+  --query-diversity-weight 0.0 \
   --epochs 20 \
   --input-length 13 \
   --output-length 13 \
@@ -170,6 +172,10 @@ The training loop includes:
   `clear_sky_ghi > --clear-sky-threshold`
 - weighted CSI loss for low-CSI cloudy hours
 - optional reconstructed-GHI loss term controlled by `--ghi-loss-weight`
+- hour-aware Perceiver output queries via learnable forecast-hour embeddings
+- optional output-query diversity regularization via
+  `--use-query-diversity-loss --query-diversity-weight <value>`
+- query cosine-similarity diagnostics and heatmaps after validation
 - `tqdm` progress bar
 - CSV logging with CSI and reconstructed-GHI metrics
 - validation prediction CSVs under `outputs/predictions/`

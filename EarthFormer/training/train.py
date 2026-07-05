@@ -36,9 +36,29 @@ from training.losses import valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi, validate  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
-from utils.plotting import save_training_plots  # noqa: E402
 from utils.precision import autocast_context, build_grad_scaler, resolve_amp_dtype  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
+
+try:
+    from utils.plotting import save_query_similarity_heatmap, save_training_plots  # noqa: E402
+except ImportError:
+    from utils.plotting import save_training_plots  # noqa: E402
+
+    def save_query_similarity_heatmap(
+        similarity: torch.Tensor,
+        output_dir: str | Path,
+        epoch: int,
+        plot_dir: str | Path | None = None,
+    ) -> Path | None:
+        """Gracefully skip query heatmaps when Colab has a stale plotting module."""
+        if not getattr(save_query_similarity_heatmap, "_warned", False):
+            print(
+                "WARNING: query similarity heatmaps are unavailable because "
+                "`utils.plotting.save_query_similarity_heatmap` was not found. "
+                "Update EarthFormer/utils/plotting.py or restart the runtime after syncing."
+            )
+            setattr(save_query_similarity_heatmap, "_warned", True)
+        return None
 
 try:
     from utils.plotting import save_validation_diagnostic_plots  # noqa: E402
@@ -186,12 +206,38 @@ class EarthFormerTrainer:
         """Return the head learning rate for backwards-compatible logging."""
         return float(self.current_lrs().get("head", self.optimizer.param_groups[-1]["lr"]))
 
+    def query_diversity_regularization(self, steps: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return weighted and raw query diversity losses."""
+        if (
+            not self.config.use_query_diversity_loss
+            or self.config.query_diversity_weight <= 0.0
+            or not hasattr(self.model, "query_diversity_loss")
+        ):
+            zero = next(self.model.parameters()).new_zeros(())
+            return zero, zero
+        raw_loss = self.model.query_diversity_loss(steps)
+        weighted_loss = self.config.query_diversity_weight * raw_loss
+        return weighted_loss, raw_loss
+
+    def query_similarity_diagnostics(self, epoch: int) -> tuple[dict[str, float], Path | None]:
+        """Return and plot effective output-query similarity diagnostics."""
+        with torch.no_grad():
+            similarity = self.model.query_similarity_matrix(self.config.output_length)
+            stats = self.model.query_similarity_stats(self.config.output_length)
+        heatmap_path = save_query_similarity_heatmap(
+            similarity=similarity,
+            output_dir=self.config.output_dir,
+            epoch=epoch,
+        )
+        return stats, heatmap_path
+
     def train_one_epoch(self, epoch: int) -> float:
         """Run one training epoch and return average training loss."""
         self.model.train()
         total_loss = 0.0
         total_csi_loss = 0.0
         total_ghi_loss = 0.0
+        total_query_diversity_loss = 0.0
         total_valid_positions = 0
         total_positions = 0
         progress = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.config.epochs}", leave=False)
@@ -289,6 +335,10 @@ class EarthFormerTrainer:
                     loss = loss_result
                     csi_loss = loss_result
                     ghi_loss = loss_result.new_zeros(())
+                query_diversity_weighted, query_diversity_raw = (
+                    self.query_diversity_regularization(targets.shape[1])
+                )
+                loss = loss + query_diversity_weighted
                 assert_scalar_finite(
                     "loss",
                     loss,
@@ -328,11 +378,13 @@ class EarthFormerTrainer:
             total_loss += float(loss.item()) * valid_count
             total_csi_loss += float(csi_loss.detach().cpu()) * valid_count
             total_ghi_loss += float(ghi_loss.detach().cpu()) * valid_count
+            total_query_diversity_loss += float(query_diversity_raw.detach().cpu()) * valid_count
             total_valid_positions += valid_count
             progress.set_postfix(
                 loss=f"{loss.item():.5f}",
                 csi=f"{float(csi_loss.detach().cpu()):.5f}",
                 ghi=f"{float(ghi_loss.detach().cpu()):.5f}",
+                qdiv=f"{float(query_diversity_raw.detach().cpu()):.4f}",
                 valid=f"{valid_count / max(targets.numel(), 1):.3f}",
                 grad=f"{float(gradient_stats['total_norm']):.3e}",
                 lr=f"{self.current_lr():.3e}",
@@ -344,6 +396,7 @@ class EarthFormerTrainer:
             "train_loss": total_loss / total_valid_positions,
             "train_csi_loss": total_csi_loss / total_valid_positions,
             "train_ghi_loss": total_ghi_loss / total_valid_positions,
+            "train_query_diversity_loss": total_query_diversity_loss / total_valid_positions,
             "train_valid_fraction": total_valid_positions / max(total_positions, 1),
         }
         return self.last_train_metrics["train_loss"]
@@ -454,6 +507,7 @@ class EarthFormerTrainer:
                 clear_sky_threshold=self.config.clear_sky_threshold,
             )
             validation_loss = float(validation_metrics["val_loss"])
+            query_stats, query_heatmap_path = self.query_similarity_diagnostics(epoch)
             lrs = self.current_lrs()
             improved = validation_loss < self.best_loss
             if improved:
@@ -472,6 +526,9 @@ class EarthFormerTrainer:
                 "train_loss": float(train_loss),
                 "train_csi_loss": float(self.last_train_metrics.get("train_csi_loss", train_loss)),
                 "train_ghi_loss": float(self.last_train_metrics.get("train_ghi_loss", 0.0)),
+                "train_query_diversity_loss": float(
+                    self.last_train_metrics.get("train_query_diversity_loss", 0.0)
+                ),
                 "train_valid_fraction": float(self.last_train_metrics.get("train_valid_fraction", 0.0)),
                 "val_loss": validation_loss,
                 "val_csi_loss": float(validation_metrics["val_csi_loss"]),
@@ -487,6 +544,9 @@ class EarthFormerTrainer:
                 "GHI_nRMSE": float(validation_metrics["GHI_nRMSE"]),
                 "GHI_R2": float(validation_metrics["GHI_R2"]),
                 "GHI_MBE": float(validation_metrics["GHI_MBE"]),
+                "query_similarity_mean": float(query_stats["mean"]),
+                "query_similarity_min": float(query_stats["min"]),
+                "query_similarity_max": float(query_stats["max"]),
                 "learning_rate": float(lrs.get("head", self.current_lr())),
                 "lr_backbone": float(lrs.get("backbone", 0.0)),
                 "lr_head": float(lrs.get("head", self.current_lr())),
@@ -503,6 +563,8 @@ class EarthFormerTrainer:
                 output_dir=self.config.output_dir,
                 epoch=epoch,
             )
+            if query_heatmap_path is not None:
+                plot_paths["query_similarity"] = query_heatmap_path
             plot_paths.update(
                 save_validation_diagnostic_plots(
                     prediction_rows,
@@ -519,6 +581,7 @@ class EarthFormerTrainer:
                 f"Train Loss: {train_loss:.6f}\n"
                 f"Train CSI Loss: {self.last_train_metrics.get('train_csi_loss', train_loss):.6f}\n"
                 f"Train GHI Loss: {self.last_train_metrics.get('train_ghi_loss', 0.0):.6f}\n"
+                f"Query Diversity Loss: {self.last_train_metrics.get('train_query_diversity_loss', 0.0):.6f}\n"
                 f"Validation Loss: {validation_loss:.6f}\n"
                 f"Validation CSI Loss: {validation_metrics['val_csi_loss']:.6f}\n"
                 f"Validation GHI Loss: {validation_metrics['val_ghi_loss']:.6f}\n"
@@ -526,6 +589,8 @@ class EarthFormerTrainer:
                 f"CSI RMSE: {validation_metrics['CSI_RMSE']:.6f}\n"
                 f"CSI MAE: {validation_metrics['CSI_MAE']:.6f}\n"
                 f"GHI RMSE: {validation_metrics['GHI_RMSE']:.6f}\n"
+                f"Query Similarity mean/min/max: "
+                f"{query_stats['mean']:.4f}/{query_stats['min']:.4f}/{query_stats['max']:.4f}\n"
                 f"LR backbone: {lrs.get('backbone', 0.0):.3e}\n"
                 f"LR head: {lrs.get('head', self.current_lr()):.3e}\n"
                 f"Best Val: {self.best_loss:.6f}\n"
@@ -622,6 +687,10 @@ class EarthFormerTrainer:
                 clear_sky_ghi=clear_sky_ghi,
                 target_ghi=target_ghi,
             )
+            query_diversity_weighted, _query_diversity_raw = (
+                self.query_diversity_regularization(targets.shape[1])
+            )
+            loss = loss + query_diversity_weighted
 
         print(f"Loss: {loss.item():.6f}")
 
@@ -788,6 +857,10 @@ class EarthFormerTrainer:
                         clear_sky_ghi=clear_sky_ghi,
                         target_ghi=target_ghi,
                     )
+                    query_diversity_weighted, _query_diversity_raw = (
+                        self.query_diversity_regularization(targets.shape[1])
+                    )
+                    loss = loss + query_diversity_weighted
 
                 self.scaler.scale(loss).backward()
 
@@ -862,6 +935,9 @@ class EarthFormerTrainer:
                 clear_sky_threshold=self.config.clear_sky_threshold,
             )
             val = float(val_metrics["val_loss"])
+            query_stats, _query_heatmap_path = self.query_similarity_diagnostics(epoch)
+            if _query_heatmap_path is not None:
+                self.artifacts.mirror_output_file(_query_heatmap_path)
 
             improved = val < self.best_loss
             if improved:
@@ -883,6 +959,10 @@ class EarthFormerTrainer:
                 train_loss=train,
                 train_csi_loss=self.last_train_metrics.get("train_csi_loss", train),
                 train_ghi_loss=self.last_train_metrics.get("train_ghi_loss", 0.0),
+                train_query_diversity_loss=self.last_train_metrics.get(
+                    "train_query_diversity_loss",
+                    0.0,
+                ),
                 train_valid_fraction=self.last_train_metrics.get("train_valid_fraction", 0.0),
                 val_loss=val,
                 val_csi_loss=float(val_metrics["val_csi_loss"]),
@@ -898,6 +978,9 @@ class EarthFormerTrainer:
                 GHI_nRMSE=float(val_metrics["GHI_nRMSE"]),
                 GHI_R2=float(val_metrics["GHI_R2"]),
                 GHI_MBE=float(val_metrics["GHI_MBE"]),
+                query_similarity_mean=float(query_stats["mean"]),
+                query_similarity_min=float(query_stats["min"]),
+                query_similarity_max=float(query_stats["max"]),
                 learning_rate=lrs.get("head", self.current_lr()),
                 lr_backbone=lrs.get("backbone", 0.0),
                 lr_head=lrs.get("head", self.current_lr()),

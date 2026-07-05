@@ -27,7 +27,7 @@ if str(PREP_MODELS_ROOT) not in sys.path:
 from configs.config import build_arg_parser, config_from_args  # noqa: E402
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
-from training.checkpoint import load_checkpoint  # noqa: E402
+from training.checkpoint import load_checkpoint, load_model_state_dict_compatible  # noqa: E402
 from training.losses import valid_hour_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
@@ -264,7 +264,7 @@ def load_model(config: Any, checkpoint_path: Path, device: torch.device) -> torc
     model = build_perceiver_readout_model(config).to(device)
     checkpoint = load_checkpoint(checkpoint_path, map_location=device)
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    model.load_state_dict(state)
+    load_model_state_dict_compatible(model, state)
     model.eval()
     return model
 

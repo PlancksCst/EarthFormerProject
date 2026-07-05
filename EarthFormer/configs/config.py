@@ -162,6 +162,10 @@ class TrainingConfig:
     num_attention_heads: int = int(os.environ.get("EARTHFORMER_READOUT_HEADS", "4"))
     readout_dropout: float = float(os.environ.get("EARTHFORMER_READOUT_DROPOUT", "0.1"))
     regression_hidden_dim: int = int(os.environ.get("EARTHFORMER_REGRESSION_HIDDEN", "32"))
+    use_hour_query_embedding: bool = os.environ.get("EARTHFORMER_USE_HOUR_QUERY_EMBEDDING", "1") != "0"
+    query_hour_embedding_dim: int | None = None
+    use_query_diversity_loss: bool = os.environ.get("EARTHFORMER_USE_QUERY_DIVERSITY_LOSS", "0") == "1"
+    query_diversity_weight: float = float(os.environ.get("EARTHFORMER_QUERY_DIVERSITY_WEIGHT", "0.0"))
     freeze_earthformer: bool = os.environ.get("EARTHFORMER_FREEZE_BACKBONE", "0") == "1"
     mirror_artifacts: bool = os.environ.get("EARTHFORMER_MIRROR_ARTIFACTS", "1") != "0"
 
@@ -225,6 +229,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-attention-heads", type=int, default=None)
     parser.add_argument("--readout-dropout", type=float, default=None)
     parser.add_argument("--regression-hidden-dim", type=int, default=None)
+    parser.add_argument("--use-hour-query-embedding", action="store_true")
+    parser.add_argument("--no-hour-query-embedding", action="store_true")
+    parser.add_argument("--query-hour-embedding-dim", type=int, default=None)
+    parser.add_argument("--use-query-diversity-loss", action="store_true")
+    parser.add_argument("--no-query-diversity-loss", action="store_true")
+    parser.add_argument("--query-diversity-weight", type=float, default=None)
     parser.add_argument("--freeze-earthformer", action="store_true")
     parser.add_argument("--no-artifact-mirror", action="store_true")
     return parser
@@ -274,6 +284,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "num_attention_heads": args.num_attention_heads,
         "readout_dropout": args.readout_dropout,
         "regression_hidden_dim": args.regression_hidden_dim,
+        "query_hour_embedding_dim": args.query_hour_embedding_dim,
+        "query_diversity_weight": args.query_diversity_weight,
     }
     for key, value in overrides.items():
         if value is not None:
@@ -286,6 +298,16 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.head_learning_rate = args.learning_rate
     if args.no_normalize:
         cfg.normalize = False
+    if args.use_hour_query_embedding:
+        cfg.use_hour_query_embedding = True
+    if args.no_hour_query_embedding:
+        cfg.use_hour_query_embedding = False
+    if args.use_query_diversity_loss:
+        cfg.use_query_diversity_loss = True
+    if args.no_query_diversity_loss:
+        cfg.use_query_diversity_loss = False
+    elif args.query_diversity_weight is not None and args.query_diversity_weight > 0.0:
+        cfg.use_query_diversity_loss = True
     if args.freeze_earthformer:
         cfg.freeze_earthformer = True
     if args.no_artifact_mirror:

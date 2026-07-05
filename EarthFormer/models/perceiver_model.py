@@ -47,6 +47,18 @@ class EarthFormerPerceiverReadoutModel(nn.Module):
         """Iterate over newly initialized readout parameters."""
         return self.readout.parameters()
 
+    def query_similarity_matrix(self, steps: int | None = None) -> torch.Tensor:
+        """Return pairwise cosine similarity between readout output queries."""
+        return self.readout.query_similarity_matrix(steps)
+
+    def query_similarity_stats(self, steps: int | None = None) -> dict[str, float]:
+        """Return average, minimum, and maximum off-diagonal query similarity."""
+        return self.readout.query_similarity_stats(steps)
+
+    def query_diversity_loss(self, steps: int | None = None) -> torch.Tensor:
+        """Return the optional readout-query diversity regularization term."""
+        return self.readout.query_diversity_loss(steps)
+
     def freeze_earthformer(self) -> None:
         """Freeze the pretrained EarthFormer backbone."""
         for parameter in self.earthformer_parameters():

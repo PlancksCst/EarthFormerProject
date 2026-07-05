@@ -11,6 +11,11 @@ from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
+COMPATIBLE_MISSING_MODEL_KEY_PREFIXES = (
+    "readout.hour_embeddings",
+    "readout.hour_embedding_projection.",
+)
+
 
 def _serialize_value(value: Any) -> Any:
     if isinstance(value, Path):
@@ -75,6 +80,36 @@ def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") 
         return torch.load(path, map_location=map_location)
 
 
+def load_model_state_dict_compatible(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> torch.nn.modules.module._IncompatibleKeys:
+    """Load model weights while tolerating newly added query-hour parameters.
+
+    Older checkpoints do not contain the explicit hour-query embedding added to
+    the Perceiver readout. Missing keys are allowed only for that narrow
+    compatibility surface; all other missing or unexpected keys still raise.
+    """
+    result = model.load_state_dict(state_dict, strict=False)
+    missing = [
+        key
+        for key in result.missing_keys
+        if not key.startswith(COMPATIBLE_MISSING_MODEL_KEY_PREFIXES)
+    ]
+    unexpected = list(result.unexpected_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Model checkpoint is incompatible. "
+            f"Missing keys: {missing}. Unexpected keys: {unexpected}."
+        )
+    if result.missing_keys:
+        print(
+            "Loaded checkpoint with newly initialized hour-query readout "
+            f"parameters: {list(result.missing_keys)}"
+        )
+    return result
+
+
 def resume_checkpoint(
     path: str | Path,
     model: nn.Module,
@@ -85,10 +120,27 @@ def resume_checkpoint(
 ) -> tuple[int, float]:
     """Resume training state and return `(next_epoch, best_loss)`."""
     checkpoint = load_checkpoint(path, map_location=map_location)
-    model.load_state_dict(checkpoint["model"])
-    optimizer.load_state_dict(checkpoint["optimizer"])
-    if scheduler is not None and checkpoint.get("scheduler") is not None:
-        scheduler.load_state_dict(checkpoint["scheduler"])
+    load_model_state_dict_compatible(model, checkpoint["model"])
+    optimizer_restored = True
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    except ValueError as error:
+        optimizer_restored = False
+        print(
+            "WARNING: optimizer state could not be restored exactly, likely "
+            "because this checkpoint predates hour-query readout parameters. "
+            f"Continuing with a freshly initialized optimizer. Details: {error}"
+        )
+    if scheduler is not None and checkpoint.get("scheduler") is not None and optimizer_restored:
+        try:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        except Exception as error:
+            print(
+                "WARNING: scheduler state could not be restored exactly. "
+                f"Continuing with a freshly initialized scheduler. Details: {error}"
+            )
+    elif scheduler is not None and checkpoint.get("scheduler") is not None and not optimizer_restored:
+        print("WARNING: scheduler state was not restored because optimizer state was reset.")
     if scaler is not None and checkpoint.get("scaler") is not None:
         scaler.load_state_dict(checkpoint["scaler"])
     next_epoch = int(checkpoint["epoch"]) + 1

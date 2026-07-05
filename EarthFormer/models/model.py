@@ -55,6 +55,8 @@ def build_perceiver_readout_model(config: TrainingConfig) -> EarthFormerPerceive
         num_attention_heads=config.num_attention_heads,
         dropout=config.readout_dropout,
         regression_hidden_dim=config.regression_hidden_dim,
+        use_hour_query_embedding=getattr(config, "use_hour_query_embedding", True),
+        query_hour_embedding_dim=getattr(config, "query_hour_embedding_dim", None),
     )
     model = EarthFormerPerceiverReadoutModel(earthformer=earthformer, readout=readout)
     if config.freeze_earthformer:

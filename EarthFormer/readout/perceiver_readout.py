@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class PerceiverReadout(nn.Module):
@@ -31,6 +32,8 @@ class PerceiverReadout(nn.Module):
         num_attention_heads: int = 4,
         dropout: float = 0.1,
         regression_hidden_dim: int = 32,
+        use_hour_query_embedding: bool = True,
+        query_hour_embedding_dim: int | None = None,
     ) -> None:
         super().__init__()
         if latent_dim <= 0:
@@ -48,6 +51,9 @@ class PerceiverReadout(nn.Module):
             )
         if regression_hidden_dim <= 0:
             raise ValueError("regression_hidden_dim must be positive")
+        hour_embedding_dim = query_dim if query_hour_embedding_dim is None else int(query_hour_embedding_dim)
+        if hour_embedding_dim <= 0:
+            raise ValueError("query_hour_embedding_dim must be positive")
 
         self.latent_dim = int(latent_dim)
         self.query_dim = int(query_dim)
@@ -55,8 +61,22 @@ class PerceiverReadout(nn.Module):
         self.num_attention_heads = int(num_attention_heads)
         self.dropout = float(dropout)
         self.regression_hidden_dim = int(regression_hidden_dim)
+        self.use_hour_query_embedding = bool(use_hour_query_embedding)
+        self.query_hour_embedding_dim = int(hour_embedding_dim)
 
         self.output_queries = nn.Parameter(torch.empty(self.num_queries, self.query_dim))
+        self.hour_embeddings = nn.Parameter(
+            torch.empty(self.num_queries, self.query_hour_embedding_dim)
+        )
+        self.hour_embedding_projection: nn.Module
+        if self.query_hour_embedding_dim == self.query_dim:
+            self.hour_embedding_projection = nn.Identity()
+        else:
+            self.hour_embedding_projection = nn.Linear(
+                self.query_hour_embedding_dim,
+                self.query_dim,
+                bias=False,
+            )
         self.query_norm = nn.LayerNorm(self.query_dim)
         self.token_norm = nn.LayerNorm(self.latent_dim)
         self.cross_attention = nn.MultiheadAttention(
@@ -77,6 +97,9 @@ class PerceiverReadout(nn.Module):
     def reset_parameters(self) -> None:
         """Initialize only the new readout parameters."""
         nn.init.normal_(self.output_queries, mean=0.0, std=0.02)
+        nn.init.normal_(self.hour_embeddings, mean=0.0, std=0.02)
+        if isinstance(self.hour_embedding_projection, nn.Linear):
+            nn.init.xavier_uniform_(self.hour_embedding_projection.weight)
 
     def flatten_spatial_tokens(self, pre_head_latent: torch.Tensor) -> torch.Tensor:
         """Flatten `(H, W)` into deterministic row-major spatial tokens."""
@@ -90,15 +113,59 @@ class PerceiverReadout(nn.Module):
             raise ValueError(f"Expected latent_dim={self.latent_dim}, got {channels}")
         return pre_head_latent.reshape(bsz, steps, height * width, channels).contiguous()
 
-    def timestep_queries(self, batch_size: int, steps: int) -> torch.Tensor:
-        """Return the first `steps` learnable queries expanded across the batch."""
+    def query_basis(self, steps: int | None = None) -> torch.Tensor:
+        """Return the per-hour output-query vectors before batch expansion."""
+        steps = self.num_queries if steps is None else int(steps)
         if steps > self.num_queries:
             raise ValueError(
                 f"Input has T={steps}, but readout was configured with "
                 f"num_queries={self.num_queries}"
             )
-        queries = self.output_queries[:steps].unsqueeze(0)
+        queries = self.output_queries[:steps]
+        if self.use_hour_query_embedding:
+            hour_component = self.hour_embedding_projection(self.hour_embeddings[:steps])
+            queries = queries + hour_component
+        return queries
+
+    def timestep_queries(self, batch_size: int, steps: int) -> torch.Tensor:
+        """Return the first `steps` output queries expanded across the batch."""
+        queries = self.query_basis(steps).unsqueeze(0)
         return queries.expand(batch_size, steps, self.query_dim).contiguous()
+
+    def query_similarity_matrix(self, steps: int | None = None) -> torch.Tensor:
+        """Return pairwise cosine similarity between effective output queries."""
+        queries = self.query_basis(steps)
+        normalized = F.normalize(queries.float(), dim=-1, eps=1.0e-8)
+        return normalized @ normalized.transpose(0, 1)
+
+    def query_similarity_stats(self, steps: int | None = None) -> dict[str, float]:
+        """Return off-diagonal query cosine similarity diagnostics."""
+        similarity = self.query_similarity_matrix(steps)
+        if similarity.shape[0] <= 1:
+            return {"mean": 0.0, "min": 0.0, "max": 0.0}
+        off_diagonal = ~torch.eye(
+            similarity.shape[0],
+            dtype=torch.bool,
+            device=similarity.device,
+        )
+        values = similarity[off_diagonal]
+        return {
+            "mean": float(values.mean().detach().cpu()),
+            "min": float(values.min().detach().cpu()),
+            "max": float(values.max().detach().cpu()),
+        }
+
+    def query_diversity_loss(self, steps: int | None = None) -> torch.Tensor:
+        """Penalize off-diagonal cosine similarity between output queries."""
+        similarity = self.query_similarity_matrix(steps)
+        if similarity.shape[0] <= 1:
+            return similarity.new_zeros(())
+        off_diagonal = ~torch.eye(
+            similarity.shape[0],
+            dtype=torch.bool,
+            device=similarity.device,
+        )
+        return similarity[off_diagonal].pow(2).mean()
 
     def forward(self, pre_head_latent: torch.Tensor, return_debug: bool = False) -> Any:
         """Run independent per-timestep query cross-attention over spatial tokens."""
@@ -128,6 +195,9 @@ class PerceiverReadout(nn.Module):
             "prediction": regression_output,
             "flattened_tokens": spatial_tokens,
             "queries": queries,
+            "effective_query_basis": self.query_basis(steps),
+            "hour_embeddings": self.hour_embeddings[:steps],
+            "query_similarity": self.query_similarity_matrix(steps),
             "attention_output": output_embeddings,
             "regression_output": regression_output,
         }
