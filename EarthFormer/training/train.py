@@ -36,9 +36,31 @@ from training.losses import valid_mask_from_target_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi, validate  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
-from utils.plotting import save_training_plots, save_validation_diagnostic_plots  # noqa: E402
+from utils.plotting import save_training_plots  # noqa: E402
 from utils.precision import autocast_context, build_grad_scaler, resolve_amp_dtype  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
+
+try:
+    from utils.plotting import save_validation_diagnostic_plots  # noqa: E402
+    _DIAGNOSTIC_PLOTS_AVAILABLE = True
+except ImportError:
+    _DIAGNOSTIC_PLOTS_AVAILABLE = False
+
+    def save_validation_diagnostic_plots(
+        prediction_rows: list[dict[str, object]],
+        output_dir: str | Path,
+        epoch: int,
+        plot_dir: str | Path | None = None,
+    ) -> dict[str, Path]:
+        """Gracefully skip diagnostics when Colab has a stale plotting module."""
+        if not getattr(save_validation_diagnostic_plots, "_warned", False):
+            print(
+                "WARNING: validation diagnostic plots are unavailable because "
+                "`utils.plotting.save_validation_diagnostic_plots` was not found. "
+                "Update EarthFormer/utils/plotting.py or restart the runtime after syncing."
+            )
+            setattr(save_validation_diagnostic_plots, "_warned", True)
+        return {}
 
 
 
