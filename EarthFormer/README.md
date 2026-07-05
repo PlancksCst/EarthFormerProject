@@ -140,7 +140,10 @@ Useful options:
 python training/train.py \
   --dataset-root /path/to/dataset \
   --batch-size 2 \
-  --learning-rate 1e-4 \
+  --backbone-learning-rate 1e-5 \
+  --head-learning-rate 1e-4 \
+  --warmup-epochs 5 \
+  --early-stopping-patience 5 \
   --epochs 20 \
   --input-length 13 \
   --output-length 13 \
@@ -151,8 +154,9 @@ python training/train.py \
 The training loop includes:
 
 - `DataLoader`
-- AdamW optimizer
-- cosine scheduler
+- AdamW optimizer with differential learning rates for EarthFormer and readout
+- linear warmup followed by cosine scheduling
+- early stopping on validation loss
 - full-precision CUDA/CPU training by default
 - optional CUDA mixed precision with `--amp` or `EARTHFORMER_MIXED_PRECISION=1`
 - BF16 autocast by default when AMP is enabled; FP16 requires `--amp-dtype fp16`
@@ -160,8 +164,15 @@ The training loop includes:
 - validation every epoch
 - `tqdm` progress bar
 - CSV logging with CSI and reconstructed-GHI metrics
-- automatic training/validation plots under `outputs/plots/`
+- validation prediction CSVs under `outputs/predictions/`
+- distribution, scatter, and residual diagnostics under `outputs/plots/`
+- best-epoch plot copies under `outputs/best_epoch/`
 - latest and best checkpoint saving
+
+On Colab, primary artifacts are written to `/content/checkpoints` and
+`/content/outputs`. If Google Drive is mounted at
+`/content/drive/MyDrive/EarthFormer`, the same checkpoints, logs, plots,
+predictions, and reports are mirrored to the matching Drive directories.
 
 ## Perceiver IO Readout Validation
 
@@ -280,11 +291,17 @@ Each checkpoint contains:
 - scheduler state
 - AMP scaler state
 - best validation loss
+- serialized configuration
+- monitored best metric
+- early-stopping state
 
 ## Validation
 
 Validation is called automatically after every epoch. It reports MSE loss plus
 MAE, RMSE, nRMSE, and R2 for both CSI and reconstructed GHI.
+Each validation epoch also saves per-hour prediction CSVs and diagnostic plots
+for prediction distributions, prediction-vs-target scatter, residual
+histograms, and residual-vs-prediction behavior.
 
 ## Inference
 

@@ -30,6 +30,7 @@ from configs.config import TrainingConfig  # noqa: E402
 from datasets.seviri_dataset import build_dataloader, build_dataset  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.losses import MSELoss  # noqa: E402
+from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
 from utils.precision import (  # noqa: E402
     autocast_context,
@@ -73,10 +74,20 @@ def save_json_report(config: TrainingConfig, name: str, payload: dict[str, Any])
     }
     with path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, default=json_default)
+    ArtifactMirror(
+        checkpoint_dir=config.checkpoint_dir,
+        output_dir=config.output_dir,
+        enabled=config.mirror_artifacts,
+    ).mirror_output_file(path)
     return path
 
 
-def append_csv_row(path: Path, row: dict[str, Any], fieldnames: Iterable[str] | None = None) -> None:
+def append_csv_row(
+    path: Path,
+    row: dict[str, Any],
+    fieldnames: Iterable[str] | None = None,
+    config: TrainingConfig | None = None,
+) -> None:
     """Append one row to a CSV file, creating a header when needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(fieldnames or row.keys())
@@ -86,6 +97,12 @@ def append_csv_row(path: Path, row: dict[str, Any], fieldnames: Iterable[str] | 
         if not exists:
             writer.writeheader()
         writer.writerow({field: row.get(field) for field in fields})
+    if config is not None:
+        ArtifactMirror(
+            checkpoint_dir=config.checkpoint_dir,
+            output_dir=config.output_dir,
+            enabled=config.mirror_artifacts,
+        ).mirror_output_file(path)
 
 
 def print_json(payload: dict[str, Any]) -> None:

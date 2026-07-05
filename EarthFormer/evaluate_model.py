@@ -30,6 +30,7 @@ from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint  # noqa: E402
 from training.losses import valid_mask_from_target_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
+from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.precision import amp_dtype_label, autocast_context, resolve_amp_dtype  # noqa: E402
 from utils.seed import seed_everything  # noqa: E402
 
@@ -896,8 +897,13 @@ def main() -> None:
     seed_everything(config.random_seed)
     configure_style()
 
-    evaluation_root = args.evaluation_dir or (PROJECT_ROOT / "evaluation")
+    evaluation_root = args.evaluation_dir or (config.output_dir / "evaluation")
     dirs = EvaluationDirs.create(evaluation_root)
+    artifacts = ArtifactMirror(
+        checkpoint_dir=config.checkpoint_dir,
+        output_dir=config.output_dir,
+        enabled=config.mirror_artifacts,
+    )
     checkpoint_path = args.checkpoint or (config.checkpoint_dir / "best.pt")
     device = torch.device(config.resolved_device())
 
@@ -921,6 +927,7 @@ def main() -> None:
         args=args,
         seed=config.random_seed,
     )
+    artifacts.mirror_output_tree(dirs.root)
 
     summary = metric_tables["overall"].iloc[0].to_dict()
     print("Evaluation complete")

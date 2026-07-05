@@ -54,6 +54,8 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         (config.elevation_csv, "--elevation-csv"),
         (config.batch_size, "--batch-size"),
         (config.learning_rate, "--learning-rate"),
+        (config.backbone_learning_rate, "--backbone-learning-rate"),
+        (config.head_learning_rate, "--head-learning-rate"),
         (config.weight_decay, "--weight-decay"),
         (config.epochs, "--epochs"),
         (config.num_workers, "--num-workers"),
@@ -65,6 +67,8 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         (config.random_seed, "--seed"),
         (config.amp_dtype, "--amp-dtype"),
         (config.gradient_clip, "--gradient-clip"),
+        (config.warmup_epochs, "--warmup-epochs"),
+        (config.early_stopping_patience, "--early-stopping-patience"),
         (config.scheduler_t_max, "--scheduler-t-max"),
         (config.scheduler_eta_min, "--scheduler-eta-min"),
         (config.input_length, "--input-length"),
@@ -87,6 +91,8 @@ def common_child_args(config: TrainingConfig) -> list[str]:
         forwarded.append("--no-normalize")
     if config.freeze_earthformer:
         forwarded.append("--freeze-earthformer")
+    if not config.mirror_artifacts:
+        forwarded.append("--no-artifact-mirror")
     return forwarded
 
 
@@ -267,6 +273,7 @@ def main() -> None:
                 "execution_time_seconds": result["execution_time_seconds"],
                 "report_path": result["report_path"],
             },
+            config=config,
         )
         print(
             f"{script_name}: {result['status']} "

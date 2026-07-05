@@ -129,7 +129,7 @@ def main() -> None:
             "all_finite": str(all_finite),
         }
         epoch_rows.append(row)
-        append_csv_row(csv_path, row)
+        append_csv_row(csv_path, row, config=config)
         print(
             f"epoch={epoch:03d} loss={final_loss:.6f} "
             f"prediction_variance={final_prediction_variance:.6f} "
@@ -169,6 +169,7 @@ def main() -> None:
             "updated_parameter_tensors": "",
             "elapsed_seconds": payload["elapsed_seconds"],
         },
+        config=config,
     )
     payload["report_path"] = str(report_path)
     print_json(payload)

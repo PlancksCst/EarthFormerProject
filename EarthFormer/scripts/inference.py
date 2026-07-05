@@ -20,6 +20,7 @@ from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
+from utils.artifacts import ArtifactMirror  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -82,6 +83,11 @@ def main() -> None:
         },
         output_file,
     )
+    ArtifactMirror(
+        checkpoint_dir=config.checkpoint_dir,
+        output_dir=config.output_dir,
+        enabled=config.mirror_artifacts,
+    ).mirror_output_file(output_file)
     print(f"Saved inference output to {output_file}")
 
 

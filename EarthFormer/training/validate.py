@@ -48,6 +48,61 @@ def _first_metadata_value(batch: dict[str, Any], key: str) -> Any:
     return value
 
 
+def _metadata_value(batch: dict[str, Any], key: str, index: int) -> Any:
+    value = batch.get(key)
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        item = value[index]
+        return item.item() if item.numel() == 1 else item.detach().cpu().tolist()
+    if isinstance(value, (list, tuple)):
+        return value[index] if index < len(value) else None
+    return value
+
+
+def _prediction_rows(
+    batch: dict[str, Any],
+    predictions_csi: torch.Tensor,
+    predictions_ghi: torch.Tensor,
+    targets_csi: torch.Tensor,
+    targets_ghi: torch.Tensor,
+    clear_sky_ghi: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> list[dict[str, Any]]:
+    pred_csi = predictions_csi.detach().float().cpu()
+    pred_ghi = predictions_ghi.detach().float().cpu()
+    target_csi = targets_csi.detach().float().cpu()
+    target_ghi = targets_ghi.detach().float().cpu()
+    clear = clear_sky_ghi.detach().float().cpu()
+    valid = valid_mask.detach().cpu().bool()
+
+    rows: list[dict[str, Any]] = []
+    batch_size, horizon = pred_csi.shape
+    for sample_index in range(batch_size):
+        metadata = {
+            "sample_id": _metadata_value(batch, "sample_id", sample_index),
+            "location": _metadata_value(batch, "location", sample_index),
+            "input_day": _metadata_value(batch, "input_day", sample_index),
+            "day": _metadata_value(batch, "target_day", sample_index),
+            "target_day": _metadata_value(batch, "target_day", sample_index),
+        }
+        for hour_index in range(horizon):
+            rows.append(
+                {
+                    **metadata,
+                    "hour": hour_index + 1,
+                    "forecast_hour": hour_index + 1,
+                    "valid": bool(valid[sample_index, hour_index]),
+                    "target_csi": float(target_csi[sample_index, hour_index]),
+                    "predicted_csi": float(pred_csi[sample_index, hour_index]),
+                    "target_ghi": float(target_ghi[sample_index, hour_index]),
+                    "predicted_ghi": float(pred_ghi[sample_index, hour_index]),
+                    "clear_sky_ghi": float(clear[sample_index, hour_index]),
+                }
+            )
+    return rows
+
+
 @torch.no_grad()
 def validate(
     model: nn.Module,
@@ -56,6 +111,7 @@ def validate(
     device: torch.device,
     use_amp: bool = False,
     amp_dtype: torch.dtype | None = None,
+    collect_predictions: bool = False,
 ) -> dict[str, Any]:
     """Return validation loss, CSI metrics, GHI metrics, and one plot sample."""
     model.eval()
@@ -66,6 +122,7 @@ def validate(
     csi_targets: list[torch.Tensor] = []
     ghi_predictions: list[torch.Tensor] = []
     ghi_targets: list[torch.Tensor] = []
+    prediction_rows: list[dict[str, Any]] = []
     sample: dict[str, Any] | None = None
 
     for batch_index, batch in enumerate(dataloader):
@@ -149,6 +206,18 @@ def validate(
         csi_targets.append(targets.detach().cpu()[valid_mask_cpu])
         ghi_predictions.append(prediction_ghi.detach().cpu()[valid_mask_cpu])
         ghi_targets.append(target_ghi_tensor.detach().cpu()[valid_mask_cpu])
+        if collect_predictions:
+            prediction_rows.extend(
+                _prediction_rows(
+                    batch=batch,
+                    predictions_csi=predictions,
+                    predictions_ghi=prediction_ghi,
+                    targets_csi=targets,
+                    targets_ghi=target_ghi_tensor,
+                    clear_sky_ghi=clear_sky_ghi,
+                    valid_mask=valid_mask,
+                )
+            )
 
         if sample is None:
             sample = {
@@ -175,4 +244,6 @@ def validate(
     metrics.update(forecast_metrics(all_csi_predictions, all_csi_targets, prefix="CSI"))
     metrics.update(forecast_metrics(all_ghi_predictions, all_ghi_targets, prefix="GHI"))
     metrics["sample"] = sample
+    if collect_predictions:
+        metrics["predictions"] = prediction_rows
     return metrics

@@ -30,6 +30,7 @@ from training.debugging import (  # noqa: E402
 )
 from training.losses import MSELoss, valid_mask_from_target_mask  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi  # noqa: E402
+from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.precision import (  # noqa: E402
     amp_dtype_label,
     autocast_context,
@@ -169,6 +170,11 @@ def main() -> None:
     path = diagnostics_dir(config.output_dir) / f"{args.report_name}.json"
     with path.open("w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2, default=json_default)
+    ArtifactMirror(
+        checkpoint_dir=config.checkpoint_dir,
+        output_dir=config.output_dir,
+        enabled=config.mirror_artifacts,
+    ).mirror_output_file(path)
     report["report_path"] = str(path)
     print(json.dumps(report, indent=2, default=json_default))
 

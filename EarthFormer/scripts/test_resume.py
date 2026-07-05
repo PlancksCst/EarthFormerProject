@@ -224,6 +224,7 @@ def main() -> None:
             "updated_parameter_tensors": "",
             "elapsed_seconds": payload["elapsed_seconds"],
         },
+        config=config,
     )
     payload["report_path"] = str(report_path)
     print_json(payload)

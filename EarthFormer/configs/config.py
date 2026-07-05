@@ -123,6 +123,8 @@ class TrainingConfig:
     elevation_csv: Path = field(default_factory=discover_elevation_csv)
     batch_size: int = int(os.environ.get("EARTHFORMER_BATCH_SIZE", "8"))
     learning_rate: float = float(os.environ.get("EARTHFORMER_LR", "1e-4"))
+    backbone_learning_rate: float = float(os.environ.get("EARTHFORMER_BACKBONE_LR", "1e-5"))
+    head_learning_rate: float = float(os.environ.get("EARTHFORMER_HEAD_LR", "1e-4"))
     weight_decay: float = float(os.environ.get("EARTHFORMER_WEIGHT_DECAY", "1e-4"))
     epochs: int = int(os.environ.get("EARTHFORMER_EPOCHS", "20"))
     num_workers: int = int(os.environ.get("EARTHFORMER_NUM_WORKERS", "2"))
@@ -135,6 +137,8 @@ class TrainingConfig:
     mixed_precision: bool = os.environ.get("EARTHFORMER_MIXED_PRECISION", "0") == "1"
     amp_dtype: str = os.environ.get("EARTHFORMER_AMP_DTYPE", "bf16")
     gradient_clip: float = float(os.environ.get("EARTHFORMER_GRADIENT_CLIP", "1.0"))
+    warmup_epochs: int = int(os.environ.get("EARTHFORMER_WARMUP_EPOCHS", "5"))
+    early_stopping_patience: int = int(os.environ.get("EARTHFORMER_EARLY_STOPPING_PATIENCE", "5"))
     scheduler_t_max: int | None = None
     scheduler_eta_min: float = float(os.environ.get("EARTHFORMER_ETA_MIN", "1e-6"))
     train_split: str = "train"
@@ -155,6 +159,7 @@ class TrainingConfig:
     readout_dropout: float = float(os.environ.get("EARTHFORMER_READOUT_DROPOUT", "0.1"))
     regression_hidden_dim: int = int(os.environ.get("EARTHFORMER_REGRESSION_HIDDEN", "32"))
     freeze_earthformer: bool = os.environ.get("EARTHFORMER_FREEZE_BACKBONE", "0") == "1"
+    mirror_artifacts: bool = os.environ.get("EARTHFORMER_MIRROR_ARTIFACTS", "1") != "0"
 
     def resolved_device(self) -> str:
         """Resolve `auto` into a concrete torch device string."""
@@ -182,6 +187,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elevation-csv", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--backbone-learning-rate", type=float, default=None)
+    parser.add_argument("--head-learning-rate", type=float, default=None)
     parser.add_argument("--weight-decay", type=float, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
@@ -195,6 +202,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default=None)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--gradient-clip", type=float, default=None)
+    parser.add_argument("--warmup-epochs", type=int, default=None)
+    parser.add_argument("--early-stopping-patience", type=int, default=None)
     parser.add_argument("--scheduler-t-max", type=int, default=None)
     parser.add_argument("--scheduler-eta-min", type=float, default=None)
     parser.add_argument("--input-length", type=int, default=None)
@@ -209,6 +218,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--readout-dropout", type=float, default=None)
     parser.add_argument("--regression-hidden-dim", type=int, default=None)
     parser.add_argument("--freeze-earthformer", action="store_true")
+    parser.add_argument("--no-artifact-mirror", action="store_true")
     return parser
 
 
@@ -225,6 +235,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "elevation_csv": args.elevation_csv,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
+        "backbone_learning_rate": args.backbone_learning_rate,
+        "head_learning_rate": args.head_learning_rate,
         "weight_decay": args.weight_decay,
         "epochs": args.epochs,
         "num_workers": args.num_workers,
@@ -236,6 +248,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "random_seed": args.seed,
         "amp_dtype": args.amp_dtype,
         "gradient_clip": args.gradient_clip,
+        "warmup_epochs": args.warmup_epochs,
+        "early_stopping_patience": args.early_stopping_patience,
         "scheduler_t_max": args.scheduler_t_max,
         "scheduler_eta_min": args.scheduler_eta_min,
         "input_length": args.input_length,
@@ -256,8 +270,12 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.mixed_precision = True
     if args.no_amp:
         cfg.mixed_precision = False
+    if args.learning_rate is not None and args.head_learning_rate is None:
+        cfg.head_learning_rate = args.learning_rate
     if args.no_normalize:
         cfg.normalize = False
     if args.freeze_earthformer:
         cfg.freeze_earthformer = True
+    if args.no_artifact_mirror:
+        cfg.mirror_artifacts = False
     return cfg

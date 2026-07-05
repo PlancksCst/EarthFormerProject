@@ -22,6 +22,10 @@ class CSVLogger:
         "GHI_nRMSE",
         "GHI_R2",
         "learning_rate",
+        "lr_backbone",
+        "lr_head",
+        "best_val_loss",
+        "patience_counter",
         "epoch_time",
     ]
 
@@ -32,6 +36,22 @@ class CSVLogger:
             with self.path.open("w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=self.fieldnames)
                 writer.writeheader()
+        else:
+            self._upgrade_header_if_needed()
+
+    def _upgrade_header_if_needed(self) -> None:
+        """Rewrite an older log file with any newly added columns."""
+        with self.path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            existing_fields = list(reader.fieldnames or [])
+            if existing_fields == self.fieldnames:
+                return
+            rows = list(reader)
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in self.fieldnames})
 
     def log(self, **row: float | int | str) -> None:
         """Append one epoch row."""
