@@ -72,6 +72,8 @@ def add_predictability_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--history-hours", type=int, default=6)
     parser.add_argument("--model", choices=("simple_cnn_lstm", "frozen_earthformer_pool_mlp"), default="simple_cnn_lstm")
     parser.add_argument("--run-short-horizon", action="store_true")
+    parser.add_argument("--short-horizon-cache-days", type=int, default=32)
+    parser.add_argument("--short-horizon-shuffle", action="store_true")
     return parser
 
 

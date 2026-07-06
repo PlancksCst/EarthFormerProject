@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,8 @@ class ShortHorizonDataset(Dataset):
         max_day_samples: int | None,
         clear_sky_threshold: float,
         solar_elevation_threshold: float,
+        include_satellite: bool = True,
+        cache_days: int = 32,
     ) -> None:
         self.config = config
         self.split = split
@@ -73,6 +76,9 @@ class ShortHorizonDataset(Dataset):
         self.history_hours = int(history_hours)
         self.clear_sky_threshold = float(clear_sky_threshold)
         self.solar_elevation_threshold = float(solar_elevation_threshold)
+        self.include_satellite = bool(include_satellite)
+        self.cache_days = max(0, int(cache_days))
+        self._item_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self.base = capped_dataset(config, split=split, include_target=True, max_samples=max_day_samples)
         self.hourly = load_hourly_frame(Path(config.hourly_csv))
         self.elevation = load_elevation_frame(str(config.elevation_csv))
@@ -130,12 +136,33 @@ class ShortHorizonDataset(Dataset):
         value = float(value)
         return value if np.isfinite(value) else None
 
+    def _base_item(self, day_index: int) -> dict[str, Any]:
+        """Return one existing dataset item, with a small per-worker LRU cache."""
+        if self.cache_days <= 0:
+            return self.base[day_index]
+        if day_index in self._item_cache:
+            item = self._item_cache.pop(day_index)
+            self._item_cache[day_index] = item
+            return item
+        item = self.base[day_index]
+        self._item_cache[day_index] = item
+        while len(self._item_cache) > self.cache_days:
+            self._item_cache.popitem(last=False)
+        return item
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         entry = self.indices[index]
-        item = self.base[entry.day_index]
         row = base_metadata_row(self.base, entry.day_index)
-        location = str(item["location"])
-        input_day = pd.Timestamp(item["input_day"])
+        if self.include_satellite:
+            item = self._base_item(entry.day_index)
+            location = str(item["location"])
+            input_day_value = item["input_day"]
+            sample_id = item.get("sample_id", entry.day_index)
+        else:
+            location = str(row.location)
+            input_day_value = row.input_day
+            sample_id = int(row.sample_id) if "sample_id" in row.index else entry.day_index
+        input_day = pd.Timestamp(input_day_value)
         target_timestamp = input_day + pd.Timedelta(hours=4 + entry.target_hour_index)
         current_timestamp = input_day + pd.Timedelta(hours=4 + entry.end_index)
         target_csi, target_ghi, clear = self._hourly_values(location, target_timestamp)
@@ -148,12 +175,7 @@ class ShortHorizonDataset(Dataset):
         daylight_valid = target_finite and clear > self.clear_sky_threshold
         if solar_available:
             daylight_valid = daylight_valid and solar >= self.solar_elevation_threshold
-        satellite = item["satellite"][entry.start_index : entry.end_index + 1]
-        if satellite.shape[0] != self.history_hours:
-            raise RuntimeError(f"Bad history tensor length: {satellite.shape[0]} != {self.history_hours}")
-        sample_id = item.get("sample_id", entry.day_index)
-        return {
-            "satellite": satellite,
+        result = {
             "target": torch.tensor(0.0 if not np.isfinite(target_csi) else target_csi, dtype=torch.float32),
             "target_csi": torch.tensor(0.0 if not np.isfinite(target_csi) else target_csi, dtype=torch.float32),
             "target_ghi": torch.tensor(0.0 if not np.isfinite(target_ghi) else target_ghi, dtype=torch.float32),
@@ -173,6 +195,12 @@ class ShortHorizonDataset(Dataset):
             "solar_elevation_available": bool(solar_available),
             "source_metadata_sample_id": int(row.sample_id) if "sample_id" in row.index else int(entry.day_index),
         }
+        if self.include_satellite:
+            satellite = item["satellite"][entry.start_index : entry.end_index + 1]
+            if satellite.shape[0] != self.history_hours:
+                raise RuntimeError(f"Bad history tensor length: {satellite.shape[0]} != {self.history_hours}")
+            result["satellite"] = satellite
+        return result
 
 
 class SimpleCNNLSTM(nn.Module):
@@ -230,7 +258,14 @@ class FrozenEarthFormerPoolMLP(nn.Module):
         return self.regression(torch.cat([mean, std], dim=-1)).squeeze(-1)
 
 
-def short_loader(context: Any, split: str, lead: int, max_day_samples: int | None, shuffle: bool) -> DataLoader:
+def short_loader(
+    context: Any,
+    split: str,
+    lead: int,
+    max_day_samples: int | None,
+    shuffle: bool,
+    include_satellite: bool = True,
+) -> DataLoader:
     """Build a short-horizon dataloader for one lead time."""
     dataset = ShortHorizonDataset(
         config=context.config,
@@ -240,6 +275,8 @@ def short_loader(context: Any, split: str, lead: int, max_day_samples: int | Non
         max_day_samples=max_day_samples,
         clear_sky_threshold=float(context.config.clear_sky_threshold),
         solar_elevation_threshold=float(context.args.solar_elevation_threshold),
+        include_satellite=include_satellite,
+        cache_days=int(context.args.short_horizon_cache_days),
     )
     return DataLoader(
         dataset,
@@ -248,6 +285,7 @@ def short_loader(context: Any, split: str, lead: int, max_day_samples: int | Non
         num_workers=context.config.num_workers,
         pin_memory=context.config.resolved_device().startswith("cuda"),
         drop_last=False,
+        persistent_workers=context.config.num_workers > 0,
     )
 
 
@@ -271,7 +309,14 @@ def train_model(context: Any, lead: int) -> nn.Module:
     """Train one diagnostic short-horizon model for one lead time."""
     model = make_model(context)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(context.config.learning_rate), weight_decay=float(context.config.weight_decay))
-    loader = short_loader(context, context.args.train_split, lead, context.args.max_train_samples, shuffle=True)
+    loader = short_loader(
+        context,
+        context.args.train_split,
+        lead,
+        context.args.max_train_samples,
+        shuffle=bool(context.args.short_horizon_shuffle),
+        include_satellite=True,
+    )
     epochs = int(context.config.epochs)
     for epoch in range(1, epochs + 1):
         model.train()
@@ -393,7 +438,7 @@ def baseline_predictions(batch: dict[str, Any], stats: dict[str, Any]) -> dict[s
 
 def evaluate_lead(context: Any, model: nn.Module, lead: int, stats: dict[str, Any]) -> list[dict[str, Any]]:
     """Evaluate model and baselines for one lead."""
-    loader = short_loader(context, context.args.eval_split, lead, context.args.max_eval_samples, shuffle=False)
+    loader = short_loader(context, context.args.eval_split, lead, context.args.max_eval_samples, shuffle=False, include_satellite=True)
     rows: list[dict[str, Any]] = []
     sample_start = 0
     model.eval()
@@ -493,8 +538,23 @@ def main() -> None:
     leads = parse_int_list(args.lead_hours)
     all_rows: list[dict[str, Any]] = []
     for lead in leads:
-        train_loader = short_loader(context, args.train_split, lead, args.max_train_samples, shuffle=False)
+        train_loader = short_loader(
+            context,
+            args.train_split,
+            lead,
+            args.max_train_samples,
+            shuffle=False,
+            include_satellite=False,
+        )
         stats = train_short_climatology(train_loader)
+        train_windows = len(short_loader(context, args.train_split, lead, args.max_train_samples, shuffle=False, include_satellite=False).dataset)
+        eval_windows = len(short_loader(context, args.eval_split, lead, args.max_eval_samples, shuffle=False, include_satellite=False).dataset)
+        print(
+            f"lead={lead}h windows: train={train_windows}, eval={eval_windows}, "
+            f"epochs={int(context.config.epochs)}, batch_size={context.config.batch_size}, "
+            f"cache_days={int(context.args.short_horizon_cache_days)}, "
+            f"shuffle={bool(context.args.short_horizon_shuffle)}"
+        )
         model = train_model(context, lead)
         all_rows.extend(evaluate_lead(context, model, lead, stats))
 
