@@ -184,7 +184,7 @@ class ShortHorizonDataset(Dataset):
             "current_csi": torch.tensor(np.nan if not np.isfinite(current_csi) else current_csi, dtype=torch.float32),
             "sample_id": int(sample_id) if not isinstance(sample_id, torch.Tensor) else int(sample_id.item()),
             "location": location,
-            "input_day": str(item["input_day"]),
+            "input_day": str(input_day_value),
             "target_day": str(input_day.date()),
             "target_timestamp": str(target_timestamp),
             "forecast_hour": int(entry.target_hour_index + 1),
