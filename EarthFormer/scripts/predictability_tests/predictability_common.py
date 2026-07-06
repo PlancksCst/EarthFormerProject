@@ -70,10 +70,16 @@ def add_predictability_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     parser.add_argument("--solar-elevation-threshold", type=float, default=5.0)
     parser.add_argument("--lead-hours", default="1,2,3,4,6")
     parser.add_argument("--history-hours", type=int, default=6)
-    parser.add_argument("--model", choices=("simple_cnn_lstm", "frozen_earthformer_pool_mlp"), default="simple_cnn_lstm")
+    parser.add_argument(
+        "--model",
+        choices=("simple_cnn_lstm", "frozen_earthformer_pool_mlp", "all"),
+        default="simple_cnn_lstm",
+    )
     parser.add_argument("--run-short-horizon", action="store_true")
     parser.add_argument("--short-horizon-cache-days", type=int, default=32)
-    parser.add_argument("--short-horizon-shuffle", action="store_true")
+    parser.add_argument("--short-horizon-shuffle", dest="short_horizon_shuffle", action="store_true", default=True)
+    parser.add_argument("--no-short-horizon-shuffle", dest="short_horizon_shuffle", action="store_false")
+    parser.add_argument("--prediction-std-ratio-threshold", type=float, default=0.10)
     return parser
 
 
@@ -411,6 +417,8 @@ def common_cli(args: argparse.Namespace) -> list[str]:
         ("--history-hours", args.history_hours),
         ("--model", args.model),
         ("--epochs", args.epochs),
+        ("--short-horizon-cache-days", getattr(args, "short_horizon_cache_days", None)),
+        ("--prediction-std-ratio-threshold", getattr(args, "prediction_std_ratio_threshold", None)),
     ]
     cli: list[str] = []
     for flag, value in pairs:
@@ -418,17 +426,21 @@ def common_cli(args: argparse.Namespace) -> list[str]:
             cli.extend([flag, str(value)])
     if getattr(args, "no_artifact_mirror", False):
         cli.append("--no-artifact-mirror")
+    if getattr(args, "short_horizon_shuffle", True):
+        cli.append("--short-horizon-shuffle")
+    else:
+        cli.append("--no-short-horizon-shuffle")
     return cli
 
 
 def run_child(script: Path, args: argparse.Namespace, output_dir: Path) -> dict[str, Any]:
     """Run a predictability child script."""
     command = [sys.executable, str(script), *common_cli(args), "--output-dir", str(output_dir)]
-    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    print(f"\nRunning: {script.name}", flush=True)
+    print(" ".join(str(part) for part in command), flush=True)
+    result = subprocess.run(command, text=True, check=False)
     return {
         "script": script.name,
         "returncode": result.returncode,
         "ok": result.returncode == 0,
-        "stdout_tail": result.stdout[-4000:],
-        "stderr_tail": result.stderr[-4000:],
     }

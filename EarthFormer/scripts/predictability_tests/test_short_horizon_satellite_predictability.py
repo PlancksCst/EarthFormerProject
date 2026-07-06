@@ -8,6 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np
 import pandas as pd
 import torch
@@ -30,6 +35,7 @@ from predictability_common import (  # type: ignore
     write_csv,
     write_json,
 )
+from diagnostic_common import metrics_from_rows  # type: ignore
 from diagnostic_common import load_elevation_frame, solar_column  # type: ignore
 
 
@@ -289,13 +295,20 @@ def short_loader(
     )
 
 
-def make_model(context: Any) -> nn.Module:
+def requested_model_names(model_name: str) -> list[str]:
+    """Return diagnostic model names to run."""
+    if model_name == "all":
+        return ["simple_cnn_lstm", "frozen_earthformer_pool_mlp"]
+    return [model_name]
+
+
+def make_model(context: Any, model_name: str) -> nn.Module:
     """Construct the requested diagnostic model."""
-    if context.args.model == "simple_cnn_lstm":
+    if model_name == "simple_cnn_lstm":
         return SimpleCNNLSTM(input_channels=int(context.config.input_channels)).to(context.device)
-    if context.args.model == "frozen_earthformer_pool_mlp":
+    if model_name == "frozen_earthformer_pool_mlp":
         return FrozenEarthFormerPoolMLP(context).to(context.device)
-    raise ValueError(f"Unknown short-horizon model: {context.args.model}")
+    raise ValueError(f"Unknown short-horizon model: {model_name}")
 
 
 def masked_scalar_mse(prediction: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
@@ -305,16 +318,21 @@ def masked_scalar_mse(prediction: torch.Tensor, target: torch.Tensor, valid: tor
     return ((prediction - target) ** 2)[valid].mean()
 
 
-def train_model(context: Any, lead: int) -> nn.Module:
+def train_model(context: Any, lead: int, model_name: str) -> nn.Module:
     """Train one diagnostic short-horizon model for one lead time."""
-    model = make_model(context)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(context.config.learning_rate), weight_decay=float(context.config.weight_decay))
+    model = make_model(context, model_name)
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.AdamW(
+        trainable_parameters,
+        lr=float(context.config.learning_rate),
+        weight_decay=float(context.config.weight_decay),
+    )
     loader = short_loader(
         context,
         context.args.train_split,
         lead,
         context.args.max_train_samples,
-        shuffle=bool(context.args.short_horizon_shuffle),
+        shuffle=True,
         include_satellite=True,
     )
     epochs = int(context.config.epochs)
@@ -336,7 +354,10 @@ def train_model(context: Any, lead: int) -> nn.Module:
             valid_count = int(valid.sum().detach().cpu())
             total_loss += float(loss.detach().cpu()) * valid_count
             total_valid += valid_count
-        print(f"lead={lead} epoch={epoch:03d}/{epochs:03d} loss={total_loss / max(total_valid, 1):.6f}")
+        print(
+            f"model={model_name} lead={lead} epoch={epoch:03d}/{epochs:03d} "
+            f"loss={total_loss / max(total_valid, 1):.6f}"
+        )
     return model
 
 
@@ -436,9 +457,18 @@ def baseline_predictions(batch: dict[str, Any], stats: dict[str, Any]) -> dict[s
     return predictions
 
 
-def evaluate_lead(context: Any, model: nn.Module, lead: int, stats: dict[str, Any]) -> list[dict[str, Any]]:
-    """Evaluate model and baselines for one lead."""
-    loader = short_loader(context, context.args.eval_split, lead, context.args.max_eval_samples, shuffle=False, include_satellite=True)
+def evaluate_lead(
+    context: Any,
+    model: nn.Module,
+    model_name: str,
+    lead: int,
+    stats: dict[str, Any],
+    split: str,
+    max_day_samples: int | None,
+    include_baselines: bool = True,
+) -> list[dict[str, Any]]:
+    """Evaluate one model and optional baselines for one lead/split."""
+    loader = short_loader(context, split, lead, max_day_samples, shuffle=False, include_satellite=True)
     rows: list[dict[str, Any]] = []
     sample_start = 0
     model.eval()
@@ -447,10 +477,119 @@ def evaluate_lead(context: Any, model: nn.Module, lead: int, stats: dict[str, An
             inputs = batch["satellite"].to(context.device, non_blocking=True)
             with maybe_autocast(context):
                 model_prediction = model(inputs).detach().cpu()
-            rows.extend(scalar_rows(batch, model_prediction, context.args.model, sample_start, context.args.eval_split))
-            for method, prediction in baseline_predictions(batch, stats).items():
-                rows.extend(scalar_rows(batch, prediction, method, sample_start, context.args.eval_split))
+            rows.extend(scalar_rows(batch, model_prediction, model_name, sample_start, split))
+            if include_baselines:
+                for method, prediction in baseline_predictions(batch, stats).items():
+                    rows.extend(scalar_rows(batch, prediction, method, sample_start, split))
             sample_start += model_prediction.shape[0]
+    return rows
+
+
+def safe_corr(x: np.ndarray, y: np.ndarray) -> float:
+    """Return finite Pearson correlation or NaN."""
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 2 or float(np.std(x)) < 1.0e-8 or float(np.std(y)) < 1.0e-8:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def persistence_sanity_rows(context: Any, lead: int, split: str, max_day_samples: int | None) -> list[dict[str, Any]]:
+    """Check correlation between current CSI and target CSI for short horizons."""
+    loader = short_loader(context, split, lead, max_day_samples, shuffle=False, include_satellite=False)
+    current_values: list[float] = []
+    target_values: list[float] = []
+    for batch in loader:
+        valid = batch["valid"].bool()
+        current = batch["current_csi"].float()
+        target = batch["target"].float()
+        mask = valid & torch.isfinite(current) & torch.isfinite(target)
+        if int(mask.sum()) == 0:
+            continue
+        current_values.extend(current[mask].tolist())
+        target_values.extend(target[mask].tolist())
+    current_np = np.asarray(current_values, dtype=np.float64)
+    target_np = np.asarray(target_values, dtype=np.float64)
+    if current_np.size == 0:
+        return [{
+            "split": split,
+            "lead_hours": lead,
+            "valid_count": 0,
+            "current_target_pearson": float("nan"),
+            "current_target_rmse": float("nan"),
+            "current_std": float("nan"),
+            "target_std": float("nan"),
+        }]
+    error = current_np - target_np
+    return [{
+        "split": split,
+        "lead_hours": lead,
+        "valid_count": int(current_np.size),
+        "current_target_pearson": safe_corr(current_np, target_np),
+        "current_target_rmse": float(np.sqrt(np.mean(error**2))),
+        "current_std": float(np.std(current_np)),
+        "target_std": float(np.std(target_np)),
+    }]
+
+
+def perturb_inputs(inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return image perturbations for short-horizon image-dependence checks."""
+    shuffled = torch.roll(inputs, shifts=1, dims=0) if inputs.shape[0] > 1 else torch.zeros_like(inputs)
+    return {
+        "zero": torch.zeros_like(inputs),
+        "shuffled": shuffled,
+        "time_reversed": torch.flip(inputs, dims=[1]),
+    }
+
+
+def perturbation_rows(
+    context: Any,
+    model: nn.Module,
+    model_name: str,
+    lead: int,
+    split: str,
+    max_day_samples: int | None,
+) -> list[dict[str, Any]]:
+    """Compare real predictions with zero/shuffled/time-reversed image inputs."""
+    loader = short_loader(context, split, lead, max_day_samples, shuffle=False, include_satellite=True)
+    rows: list[dict[str, Any]] = []
+    model.eval()
+    with torch.no_grad():
+        for batch_index, batch in enumerate(loader):
+            inputs = batch["satellite"].to(context.device, non_blocking=True)
+            target = batch["target"].to(context.device, non_blocking=True)
+            valid = batch["valid"].to(context.device, non_blocking=True).bool()
+            if int(valid.sum().detach().cpu()) == 0:
+                continue
+            with maybe_autocast(context):
+                pred_real = model(inputs)
+            for perturbation, perturbed in perturb_inputs(inputs).items():
+                with maybe_autocast(context):
+                    pred_other = model(perturbed)
+                real = pred_real.detach().float().cpu()
+                other = pred_other.detach().float().cpu()
+                tgt = target.detach().float().cpu()
+                mask = valid.detach().cpu().bool()
+                delta = (other - real)[mask]
+                real_error = (real - tgt)[mask]
+                other_error = (other - tgt)[mask]
+                rows.append(
+                    {
+                        "split": split,
+                        "lead_hours": lead,
+                        "model": model_name,
+                        "batch_index": batch_index,
+                        "perturbation": perturbation,
+                        "valid_count": int(mask.sum()),
+                        "mean_abs_delta": float(delta.abs().mean()) if delta.numel() else float("nan"),
+                        "rmse_delta": float(torch.sqrt(torch.mean(delta**2))) if delta.numel() else float("nan"),
+                        "real_forecast_rmse": float(torch.sqrt(torch.mean(real_error**2))) if real_error.numel() else float("nan"),
+                        "perturbed_forecast_rmse": float(torch.sqrt(torch.mean(other_error**2))) if other_error.numel() else float("nan"),
+                        "real_prediction_std": float(real[mask].std(unbiased=False)) if int(mask.sum()) > 1 else float("nan"),
+                        "perturbed_prediction_std": float(other[mask].std(unbiased=False)) if int(mask.sum()) > 1 else float("nan"),
+                    }
+                )
     return rows
 
 
@@ -496,7 +635,108 @@ def per_lead_metrics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return metrics
 
 
-def short_summary(metric_rows: list[dict[str, Any]], model_name: str) -> dict[str, Any]:
+def split_lead_metrics(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compute metrics by split, lead, and method."""
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return []
+    metrics = []
+    for (split, lead, method), group in frame.groupby(["split", "lead_hours", "method"], sort=True):
+        row = metrics_from_rows(group.to_dict("records"), {"method": method})
+        row["split"] = str(split)
+        row["lead_hours"] = int(lead)
+        metrics.append(row)
+    return metrics
+
+
+def save_per_lead_scatter_and_histograms(rows: list[dict[str, Any]], output_dir: Path) -> None:
+    """Save target-vs-prediction scatter plots and prediction histograms per lead/method."""
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return
+    valid = frame[frame["valid_hour"].astype(bool)].copy()
+    if valid.empty:
+        return
+    scatter_dir = output_dir / "scatter"
+    histogram_dir = output_dir / "histograms"
+    scatter_dir.mkdir(parents=True, exist_ok=True)
+    histogram_dir.mkdir(parents=True, exist_ok=True)
+    for (lead, method), group in valid.groupby(["lead_hours", "method"], sort=True):
+        target = group["target_csi"].to_numpy(dtype=np.float64)
+        prediction = group["predicted_csi"].to_numpy(dtype=np.float64)
+        finite = np.isfinite(target) & np.isfinite(prediction)
+        if finite.sum() == 0:
+            continue
+        target = target[finite]
+        prediction = prediction[finite]
+        low = float(min(target.min(), prediction.min()))
+        high = float(max(target.max(), prediction.max()))
+        if low == high:
+            low -= 0.05
+            high += 0.05
+
+        fig, ax = plt.subplots(figsize=(5.8, 5.4))
+        ax.scatter(target, prediction, s=14, alpha=0.55)
+        ax.plot([low, high], [low, high], color="black", linewidth=1.5)
+        ax.set_xlabel("Target CSI")
+        ax.set_ylabel("Predicted CSI")
+        ax.set_title(f"Lead {lead}h - {method}")
+        ax.grid(True, alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(scatter_dir / f"lead_{int(lead)}h_{method}.png", dpi=180)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(6.6, 4.8))
+        ax.hist(target, bins=30, alpha=0.55, label="target")
+        ax.hist(prediction, bins=30, alpha=0.55, label="prediction")
+        ax.set_xlabel("CSI")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Lead {lead}h CSI Distribution - {method}")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(histogram_dir / f"lead_{int(lead)}h_{method}.png", dpi=180)
+        plt.close(fig)
+
+
+def prediction_std_checks(
+    rows: list[dict[str, Any]],
+    model_names: list[str],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Return collapse warnings where prediction std is far below target std."""
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return []
+    valid = frame[frame["valid_hour"].astype(bool)].copy()
+    issues: list[dict[str, Any]] = []
+    for (split, lead, method), group in valid.groupby(["split", "lead_hours", "method"], sort=True):
+        if method not in model_names or split != "val":
+            continue
+        prediction = group["predicted_csi"].to_numpy(dtype=np.float64)
+        target = group["target_csi"].to_numpy(dtype=np.float64)
+        finite = np.isfinite(prediction) & np.isfinite(target)
+        if finite.sum() < 2:
+            continue
+        prediction_std = float(np.std(prediction[finite]))
+        target_std = float(np.std(target[finite]))
+        ratio = prediction_std / max(target_std, 1.0e-8)
+        if ratio < float(threshold):
+            issues.append(
+                {
+                    "split": split,
+                    "lead_hours": int(lead),
+                    "method": method,
+                    "prediction_std": prediction_std,
+                    "target_std": target_std,
+                    "std_ratio": ratio,
+                    "threshold": float(threshold),
+                }
+            )
+    return issues
+
+
+def short_summary(metric_rows: list[dict[str, Any]], model_names: list[str]) -> dict[str, Any]:
     """Return lead-wise flags and interpretation."""
     frame = pd.DataFrame(metric_rows)
     best_model_per_lead: dict[str, str] = {}
@@ -505,10 +745,11 @@ def short_summary(metric_rows: list[dict[str, Any]], model_name: str) -> dict[st
     for lead, group in frame.groupby("lead_hours", sort=True):
         best = group.sort_values("CSI_RMSE").iloc[0]
         best_model_per_lead[str(int(lead))] = str(best["method"])
-        model_rows = group[group["method"] == model_name]
+        model_rows = group[group["method"].isin(model_names)].copy()
         if model_rows.empty:
             continue
-        model_rmse = float(model_rows["CSI_RMSE"].iloc[0])
+        best_satellite = model_rows.sort_values("CSI_RMSE").iloc[0]
+        model_rmse = float(best_satellite["CSI_RMSE"])
         clim = group[group["method"].isin(["hourly_climatology", "location_hour_climatology"])]
         pers = group[group["method"] == "current_hour_csi_persistence"]
         beats_climatology[str(int(lead))] = bool(not clim.empty and model_rmse < float(clim["CSI_RMSE"].min()))
@@ -536,7 +777,11 @@ def main() -> None:
     if args.epochs is None:
         context.config.epochs = 10
     leads = parse_int_list(args.lead_hours)
+    model_names = requested_model_names(args.model)
     all_rows: list[dict[str, Any]] = []
+    eval_rows: list[dict[str, Any]] = []
+    perturb_rows: list[dict[str, Any]] = []
+    persistence_rows: list[dict[str, Any]] = []
     for lead in leads:
         train_loader = short_loader(
             context,
@@ -553,20 +798,68 @@ def main() -> None:
             f"lead={lead}h windows: train={train_windows}, eval={eval_windows}, "
             f"epochs={int(context.config.epochs)}, batch_size={context.config.batch_size}, "
             f"cache_days={int(context.args.short_horizon_cache_days)}, "
-            f"shuffle={bool(context.args.short_horizon_shuffle)}"
+            f"shuffle=True"
         )
-        model = train_model(context, lead)
-        all_rows.extend(evaluate_lead(context, model, lead, stats))
+        persistence_rows.extend(persistence_sanity_rows(context, lead, args.train_split, args.max_train_samples))
+        persistence_rows.extend(persistence_sanity_rows(context, lead, args.eval_split, args.max_eval_samples))
+        for model_index, model_name in enumerate(model_names):
+            model = train_model(context, lead, model_name)
+            train_rows = evaluate_lead(
+                context,
+                model,
+                model_name,
+                lead,
+                stats,
+                split=args.train_split,
+                max_day_samples=args.max_train_samples,
+                include_baselines=False,
+            )
+            validation_rows = evaluate_lead(
+                context,
+                model,
+                model_name,
+                lead,
+                stats,
+                split=args.eval_split,
+                max_day_samples=args.max_eval_samples,
+                include_baselines=model_index == 0,
+            )
+            all_rows.extend(train_rows)
+            all_rows.extend(validation_rows)
+            eval_rows.extend(validation_rows)
+            perturb_rows.extend(
+                perturbation_rows(
+                    context,
+                    model,
+                    model_name,
+                    lead,
+                    split=args.eval_split,
+                    max_day_samples=args.max_eval_samples,
+                )
+            )
 
     predictions_path = context.output_dir / "short_horizon_predictions.csv"
     write_csv(predictions_path, all_rows)
-    metric_paths = save_metric_tables(context.output_dir, "short_horizon", all_rows, label_col="method")
-    lead_metrics = per_lead_metrics(all_rows)
+    metric_paths = save_metric_tables(context.output_dir, "short_horizon", eval_rows, label_col="method")
+    lead_metrics = per_lead_metrics(eval_rows)
     per_lead_path = context.output_dir / "per_lead_time_metrics.csv"
     write_csv(per_lead_path, lead_metrics)
+    train_val_metrics = split_lead_metrics(all_rows)
+    train_val_metrics_path = context.output_dir / "train_val_metrics.csv"
+    write_csv(train_val_metrics_path, train_val_metrics)
+    perturbation_path = context.output_dir / "image_perturbation_metrics.csv"
+    write_csv(perturbation_path, perturb_rows)
+    persistence_path = context.output_dir / "persistence_sanity.csv"
+    write_csv(persistence_path, persistence_rows)
     metrics_frame = pd.read_csv(metric_paths["overall"])
     plot_rmse_bar(metrics_frame.to_dict("records"), context.output_dir / "short_horizon_rmse.png", label_col="method")
-    save_short_plots(all_rows, context.output_dir / "sample_plots")
+    save_short_plots(eval_rows, context.output_dir / "sample_plots")
+    save_per_lead_scatter_and_histograms(eval_rows, context.output_dir / "per_lead_plots")
+    collapse_issues = prediction_std_checks(
+        eval_rows,
+        model_names=model_names,
+        threshold=float(args.prediction_std_ratio_threshold),
+    )
 
     summary = {
         "dataset_root": str(context.config.dataset_root),
@@ -574,18 +867,31 @@ def main() -> None:
         "eval_split": args.eval_split,
         "lead_hours_tested": leads,
         "history_hours": int(args.history_hours),
-        "model": args.model,
+        "requested_model": args.model,
+        "models_run": model_names,
         "epochs": int(context.config.epochs),
         "max_train_samples": args.max_train_samples,
         "max_eval_samples": args.max_eval_samples,
-        **short_summary(lead_metrics, args.model),
+        "train_shuffle": True,
+        "prediction_std_ratio_threshold": float(args.prediction_std_ratio_threshold),
+        "prediction_collapse_issues": collapse_issues,
+        **short_summary(lead_metrics, model_names),
         "predictions_csv": str(predictions_path),
         "metrics": metric_paths,
         "per_lead_time_metrics_csv": str(per_lead_path),
+        "train_val_metrics_csv": str(train_val_metrics_path),
+        "image_perturbation_metrics_csv": str(perturbation_path),
+        "persistence_sanity_csv": str(persistence_path),
     }
     write_json(context.output_dir / "short_horizon_summary.json", summary)
     mirror_outputs(context)
     print(json.dumps(summary, indent=2))
+    if collapse_issues:
+        raise RuntimeError(
+            "Satellite model prediction collapse detected. "
+            f"Prediction std is below {float(args.prediction_std_ratio_threshold):.3f} "
+            f"of target std for: {collapse_issues}"
+        )
 
 
 if __name__ == "__main__":
