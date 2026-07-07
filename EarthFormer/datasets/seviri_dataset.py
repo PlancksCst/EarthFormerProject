@@ -33,6 +33,8 @@ def build_dataset(config: TrainingConfig, split: str, include_target: bool) -> S
         metadata_filename=config.metadata_filename,
         hourly_csv=str(config.hourly_csv),
         elevation_csv=str(config.elevation_csv),
+        locations_csv=str(config.locations_csv),
+        include_auxiliary_features=config.use_auxiliary_features,
     )
 
 

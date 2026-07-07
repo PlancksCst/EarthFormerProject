@@ -34,6 +34,8 @@ class PerceiverReadout(nn.Module):
         regression_hidden_dim: int = 32,
         use_hour_query_embedding: bool = True,
         query_hour_embedding_dim: int | None = None,
+        use_auxiliary_features: bool = False,
+        auxiliary_dim: int = 0,
     ) -> None:
         super().__init__()
         if latent_dim <= 0:
@@ -63,6 +65,10 @@ class PerceiverReadout(nn.Module):
         self.regression_hidden_dim = int(regression_hidden_dim)
         self.use_hour_query_embedding = bool(use_hour_query_embedding)
         self.query_hour_embedding_dim = int(hour_embedding_dim)
+        self.use_auxiliary_features = bool(use_auxiliary_features)
+        self.auxiliary_dim = int(auxiliary_dim)
+        if self.use_auxiliary_features and self.auxiliary_dim <= 0:
+            raise ValueError("auxiliary_dim must be positive when auxiliary features are enabled")
 
         self.output_queries = nn.Parameter(torch.empty(self.num_queries, self.query_dim))
         self.hour_embeddings = nn.Parameter(
@@ -77,6 +83,16 @@ class PerceiverReadout(nn.Module):
                 self.query_dim,
                 bias=False,
             )
+        self.auxiliary_query_projection: nn.Module | None
+        if self.use_auxiliary_features:
+            self.auxiliary_query_projection = nn.Sequential(
+                nn.LayerNorm(self.auxiliary_dim),
+                nn.Linear(self.auxiliary_dim, self.query_dim),
+                nn.GELU(),
+                nn.Linear(self.query_dim, self.query_dim),
+            )
+        else:
+            self.auxiliary_query_projection = None
         self.query_norm = nn.LayerNorm(self.query_dim)
         self.token_norm = nn.LayerNorm(self.latent_dim)
         self.cross_attention = nn.MultiheadAttention(
@@ -100,6 +116,12 @@ class PerceiverReadout(nn.Module):
         nn.init.normal_(self.hour_embeddings, mean=0.0, std=0.02)
         if isinstance(self.hour_embedding_projection, nn.Linear):
             nn.init.xavier_uniform_(self.hour_embedding_projection.weight)
+        if self.auxiliary_query_projection is not None:
+            for module in self.auxiliary_query_projection:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
 
     def flatten_spatial_tokens(self, pre_head_latent: torch.Tensor) -> torch.Tensor:
         """Flatten `(H, W)` into deterministic row-major spatial tokens."""
@@ -127,10 +149,52 @@ class PerceiverReadout(nn.Module):
             queries = queries + hour_component
         return queries
 
-    def timestep_queries(self, batch_size: int, steps: int) -> torch.Tensor:
+    def _validate_auxiliary_features(
+        self,
+        auxiliary_features: torch.Tensor | None,
+        batch_size: int,
+        steps: int,
+    ) -> torch.Tensor | None:
+        """Validate optional `(B,T,F)` auxiliary features."""
+        if not self.use_auxiliary_features:
+            return None
+        if auxiliary_features is None:
+            raise ValueError(
+                "This readout was configured with auxiliary features, but "
+                "no auxiliary_features tensor was provided."
+            )
+        if auxiliary_features.ndim != 3:
+            raise ValueError(
+                "Expected auxiliary_features with shape (B,T,F), got "
+                f"{tuple(auxiliary_features.shape)}"
+            )
+        expected = (batch_size, steps, self.auxiliary_dim)
+        if tuple(auxiliary_features.shape) != expected:
+            raise ValueError(
+                "auxiliary_features shape mismatch: "
+                f"expected {expected}, got {tuple(auxiliary_features.shape)}"
+            )
+        return auxiliary_features
+
+    def timestep_queries(
+        self,
+        batch_size: int,
+        steps: int,
+        auxiliary_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Return the first `steps` output queries expanded across the batch."""
         queries = self.query_basis(steps).unsqueeze(0)
-        return queries.expand(batch_size, steps, self.query_dim).contiguous()
+        queries = queries.expand(batch_size, steps, self.query_dim).contiguous()
+        auxiliary = self._validate_auxiliary_features(
+            auxiliary_features,
+            batch_size=batch_size,
+            steps=steps,
+        )
+        if auxiliary is not None:
+            assert self.auxiliary_query_projection is not None
+            auxiliary = auxiliary.to(device=queries.device, dtype=queries.dtype)
+            queries = queries + self.auxiliary_query_projection(auxiliary)
+        return queries
 
     def query_similarity_matrix(self, steps: int | None = None) -> torch.Tensor:
         """Return pairwise cosine similarity between effective output queries."""
@@ -167,12 +231,21 @@ class PerceiverReadout(nn.Module):
         )
         return similarity[off_diagonal].pow(2).mean()
 
-    def forward(self, pre_head_latent: torch.Tensor, return_debug: bool = False) -> Any:
+    def forward(
+        self,
+        pre_head_latent: torch.Tensor,
+        auxiliary_features: torch.Tensor | None = None,
+        return_debug: bool = False,
+    ) -> Any:
         """Run independent per-timestep query cross-attention over spatial tokens."""
         spatial_tokens = self.flatten_spatial_tokens(pre_head_latent)
         bsz, steps, num_tokens, _channels = spatial_tokens.shape
 
-        queries = self.timestep_queries(batch_size=bsz, steps=steps)
+        queries = self.timestep_queries(
+            batch_size=bsz,
+            steps=steps,
+            auxiliary_features=auxiliary_features,
+        )
         normalized_tokens = self.token_norm(spatial_tokens)
         normalized_queries = self.query_norm(queries)
 
@@ -197,6 +270,7 @@ class PerceiverReadout(nn.Module):
             "queries": queries,
             "effective_query_basis": self.query_basis(steps),
             "hour_embeddings": self.hour_embeddings[:steps],
+            "auxiliary_features": auxiliary_features,
             "query_similarity": self.query_similarity_matrix(steps),
             "attention_output": output_embeddings,
             "regression_output": regression_output,

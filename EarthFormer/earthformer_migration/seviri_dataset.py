@@ -1,8 +1,9 @@
 """SEVIRI dataset for EarthFormer CSI forecasting.
 
-The model consumes only the previous-day satellite image sequence. When targets
-are requested, the loader returns the next-day CSI sequence and clear-sky GHI
-needed for external GHI reconstruction.
+The backbone consumes the previous-day satellite image sequence. Optional
+auxiliary features are exposed separately for readout/query conditioning.
+When targets are requested, the loader returns the next-day CSI sequence and
+clear-sky GHI needed for external GHI reconstruction.
 """
 
 from __future__ import annotations
@@ -77,6 +78,17 @@ class SEVIRIImageSequenceDataset(Dataset):
         "ghi_target_",
         "next_day_ghi_",
     )
+    AUXILIARY_FEATURE_NAMES = (
+        "previous_day_csi",
+        "clear_sky_ghi_scaled",
+        "solar_elevation_scaled",
+        "latitude_scaled",
+        "longitude_scaled",
+        "hour_sin",
+        "hour_cos",
+        "dayofyear_sin",
+        "dayofyear_cos",
+    )
 
     def __init__(
         self,
@@ -92,6 +104,8 @@ class SEVIRIImageSequenceDataset(Dataset):
         metadata_filename: str | None = None,
         hourly_csv: str | None = None,
         elevation_csv: str | None = None,
+        locations_csv: str | None = None,
+        include_auxiliary_features: bool = False,
     ) -> None:
         self.dataset_root = os.path.abspath(dataset_root)
         self.split = split
@@ -104,6 +118,8 @@ class SEVIRIImageSequenceDataset(Dataset):
         self.target_channel_index = target_channel_index
         self.hourly_csv = hourly_csv
         self.elevation_csv = elevation_csv
+        self.locations_csv = locations_csv
+        self.include_auxiliary_features = bool(include_auxiliary_features)
 
         metadata_path = self._resolve_metadata_path(metadata_filename)
         norm_path = os.path.join(self.dataset_root, "normalization.json")
@@ -144,9 +160,12 @@ class SEVIRIImageSequenceDataset(Dataset):
         self._zarr_cache: dict[str, Any] = {}
         self.hourly_df: pd.DataFrame | None = None
         self.elevation_df: pd.DataFrame | None = None
-        if self.include_target:
+        self.locations_df: pd.DataFrame | None = None
+        if self.include_target or self.include_auxiliary_features:
             self.hourly_df = self._load_hourly_dataframe(hourly_csv)
             self.elevation_df = self._load_elevation_dataframe(elevation_csv)
+        if self.include_auxiliary_features:
+            self.locations_df = self._load_locations_dataframe(locations_csv)
 
     def __len__(self) -> int:
         return len(self.meta)
@@ -272,6 +291,23 @@ class SEVIRIImageSequenceDataset(Dataset):
         if not df.index.is_unique:
             df = df[~df.index.duplicated(keep="first")]
         return df
+
+    def _load_locations_dataframe(self, path: str | None) -> pd.DataFrame | None:
+        """Load optional station latitude/longitude metadata."""
+        csv_path = self._resolve_csv_path(
+            path=path,
+            filename="locations.csv",
+            required=False,
+        )
+        if csv_path is None:
+            return None
+        df = pd.read_csv(csv_path)
+        required = {"station", "latitude", "longitude"}
+        missing = sorted(required.difference(df.columns))
+        if missing:
+            raise KeyError(f"Missing columns in {csv_path}: {missing}")
+        df["station"] = df["station"].astype(str)
+        return df.set_index("station", drop=False)
 
     def _get_zarr(self, path: str) -> Any:
         if path not in self._zarr_cache:
@@ -552,6 +588,114 @@ class SEVIRIImageSequenceDataset(Dataset):
             return None
         return value
 
+    def _target_timestamps(self, row: pd.Series) -> list[pd.Timestamp]:
+        """Return the configured target-hour timestamps for one sample."""
+        target_day = pd.Timestamp(row.target_day)
+        return [
+            target_day + pd.Timedelta(hours=4 + pos)
+            for pos in range(self.output_length)
+        ]
+
+    def _get_solar_elevation(self, location: str, timestamp: pd.Timestamp) -> float | None:
+        """Return solar elevation in degrees for a location/timestamp if available."""
+        if self.elevation_df is not None and location in self.elevation_df.columns:
+            try:
+                value = self.elevation_df.loc[timestamp, location]
+            except KeyError:
+                value = None
+            if isinstance(value, pd.Series):
+                value = value.iloc[0]
+            if value is not None and not pd.isna(value):
+                value_float = float(value)
+                if np.isfinite(value_float):
+                    return value_float
+
+        if self.hourly_df is not None:
+            row = self._get_hourly_row(timestamp)
+            column = f"elevation_{location}"
+            if row is not None and column in row.index and not pd.isna(row[column]):
+                value_float = float(row[column])
+                if np.isfinite(value_float):
+                    return value_float
+        return None
+
+    def _location_coordinates(self, location: str) -> tuple[float, float]:
+        """Return latitude and longitude, or zeros when station metadata is unavailable."""
+        if self.locations_df is None or location not in self.locations_df.index:
+            return 0.0, 0.0
+        row = self.locations_df.loc[location]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
+        latitude = float(row["latitude"]) if not pd.isna(row["latitude"]) else 0.0
+        longitude = float(row["longitude"]) if not pd.isna(row["longitude"]) else 0.0
+        if not np.isfinite(latitude):
+            latitude = 0.0
+        if not np.isfinite(longitude):
+            longitude = 0.0
+        return latitude, longitude
+
+    def _load_auxiliary_features(self, row: pd.Series) -> dict[str, Any]:
+        """Build per-forecast-hour auxiliary features for readout conditioning."""
+        if self.hourly_df is None:
+            raise RuntimeError("Hourly CSV dataframe is required for auxiliary features")
+
+        location = str(row.location)
+        columns = self._location_columns(location)
+        timestamps = self._target_timestamps(row)
+        latitude, longitude = self._location_coordinates(location)
+        latitude_scaled = latitude / 90.0
+        longitude_scaled = longitude / 180.0
+
+        features = np.zeros(
+            (self.output_length, len(self.AUXILIARY_FEATURE_NAMES)),
+            dtype=np.float32,
+        )
+        previous_day_csi = np.zeros(self.output_length, dtype=np.float32)
+        solar_elevation = np.zeros(self.output_length, dtype=np.float32)
+
+        for pos, timestamp in enumerate(timestamps):
+            prev_csi = self._get_hourly_value(
+                columns,
+                timestamp - pd.Timedelta(days=1),
+                "csi",
+            )
+            clear_value = self._get_hourly_value(columns, timestamp, "clear")
+            elevation_value = self._get_solar_elevation(location, timestamp)
+
+            hour = timestamp.hour + timestamp.minute / 60.0
+            day_index = timestamp.dayofyear - 1
+            previous_day_csi[pos] = 0.0 if prev_csi is None else float(prev_csi)
+            solar_elevation[pos] = 0.0 if elevation_value is None else float(elevation_value)
+
+            features[pos] = np.asarray(
+                [
+                    previous_day_csi[pos],
+                    (0.0 if clear_value is None else float(clear_value)) / 1000.0,
+                    solar_elevation[pos] / 90.0,
+                    latitude_scaled,
+                    longitude_scaled,
+                    np.sin(2.0 * np.pi * hour / 24.0),
+                    np.cos(2.0 * np.pi * hour / 24.0),
+                    np.sin(2.0 * np.pi * day_index / 366.0),
+                    np.cos(2.0 * np.pi * day_index / 366.0),
+                ],
+                dtype=np.float32,
+            )
+
+        if not np.isfinite(features).all():
+            raise RuntimeError(
+                f"Non-finite auxiliary features for location={location} "
+                f"target_day={row.target_day}"
+            )
+
+        return {
+            "auxiliary_features": torch.from_numpy(features),
+            "aux_features": torch.from_numpy(features),
+            "auxiliary_feature_names": list(self.AUXILIARY_FEATURE_NAMES),
+            "previous_day_csi": torch.from_numpy(previous_day_csi.astype(np.float32)),
+            "solar_elevation": torch.from_numpy(solar_elevation.astype(np.float32)),
+        }
+
     def _persistence_impute_csi(
         self,
         location_columns: dict[str, str],
@@ -600,16 +744,12 @@ class SEVIRIImageSequenceDataset(Dataset):
         """Load target CSI, target GHI, and clear-sky GHI from the hourly CSV."""
         location = str(row.location)
         columns = self._location_columns(location)
-        target_day = pd.Timestamp(row.target_day)
         target_mask = (
             self._parse_mask(row["target_mask"])
             if "target_mask" in row.index
             else np.zeros(self.output_length, dtype=np.bool_)
         )
-        timestamps = [
-            target_day + pd.Timedelta(hours=4 + pos)
-            for pos in range(self.output_length)
-        ]
+        timestamps = self._target_timestamps(row)
 
         target_csi = np.full(self.output_length, np.nan, dtype=np.float32)
         target_ghi = np.zeros(self.output_length, dtype=np.float32)
@@ -728,6 +868,8 @@ class SEVIRIImageSequenceDataset(Dataset):
 
         if self.include_target:
             item.update(self._load_forecasting_targets(row))
+        if self.include_auxiliary_features:
+            item.update(self._load_auxiliary_features(row))
 
         return item
 

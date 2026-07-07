@@ -23,12 +23,21 @@ class EarthFormerPerceiverReadoutModel(nn.Module):
         self.earthformer = earthformer
         self.readout = readout
 
-    def forward(self, x: torch.Tensor, return_debug: bool = False) -> Any:
+    def forward(
+        self,
+        x: torch.Tensor,
+        auxiliary_features: torch.Tensor | None = None,
+        return_debug: bool = False,
+    ) -> Any:
         """Return CSI sequence predictions, optionally with intermediate tensors."""
         if return_debug:
             latent_result = self.earthformer.forward_latent(x, return_trace=True)
             pre_head_latent = latent_result["pre_head_latent"]
-            readout_result = self.readout(pre_head_latent, return_debug=True)
+            readout_result = self.readout(
+                pre_head_latent,
+                auxiliary_features=auxiliary_features,
+                return_debug=True,
+            )
             return {
                 "prediction": readout_result["prediction"],
                 "pre_head_latent": pre_head_latent,
@@ -37,7 +46,11 @@ class EarthFormerPerceiverReadoutModel(nn.Module):
             }
 
         pre_head_latent = self.earthformer.forward_latent(x, return_trace=False)
-        return self.readout(pre_head_latent, return_debug=False)
+        return self.readout(
+            pre_head_latent,
+            auxiliary_features=auxiliary_features,
+            return_debug=False,
+        )
 
     def earthformer_parameters(self) -> Iterator[nn.Parameter]:
         """Iterate over pretrained EarthFormer parameters."""

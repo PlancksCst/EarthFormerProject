@@ -12,6 +12,7 @@ class CSVLogger:
     fieldnames = [
         "epoch",
         "fix_preset",
+        "use_auxiliary_features",
         "loss_name",
         "forecast_mode",
         "residual_baseline",

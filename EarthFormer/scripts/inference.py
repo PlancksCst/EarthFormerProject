@@ -55,12 +55,22 @@ def main() -> None:
 
     batch = next(iter(loader))
     inputs = batch["satellite"].to(device, non_blocking=True)
+    auxiliary_features = None
+    if config.use_auxiliary_features:
+        aux_value = batch.get("auxiliary_features", batch.get("aux_features"))
+        if not isinstance(aux_value, torch.Tensor):
+            raise KeyError("Auxiliary features are enabled, but the batch has none.")
+        auxiliary_features = aux_value.to(device, non_blocking=True).float()
     clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"]).to(
         device,
         non_blocking=True,
     )
     with torch.no_grad():
-        result = model(inputs, return_debug=True)
+        result = model(
+            inputs,
+            auxiliary_features=auxiliary_features,
+            return_debug=True,
+        )
         prediction_csi = result["prediction"]
         prediction_ghi = reconstruct_ghi(prediction_csi, clear_sky_ghi)
 
@@ -90,6 +100,9 @@ def main() -> None:
             "target_ghi": target_ghi.cpu() if isinstance(target_ghi, torch.Tensor) else None,
             "clear_sky_ghi": clear_sky_ghi.cpu(),
             "valid_hour": valid_hour,
+            "auxiliary_features": (
+                auxiliary_features.cpu() if isinstance(auxiliary_features, torch.Tensor) else None
+            ),
             "pre_head_latent": result["pre_head_latent"].cpu(),
             "sample_id": batch["sample_id"],
             "location": batch["location"],

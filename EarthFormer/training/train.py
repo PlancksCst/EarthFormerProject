@@ -149,6 +149,7 @@ class EarthFormerTrainer:
             f"fix_preset={self.config.fix_preset}, "
             f"{self.config.forecast_mode} "
             f"(residual_baseline={self.config.residual_baseline}, "
+            f"use_auxiliary_features={self.config.use_auxiliary_features}, "
             f"freeze_backbone_epochs={self.config.freeze_backbone_epochs}, "
             f"image_dependence_weight={self.config.image_dependence_weight}, "
             f"image_dependence_margin={self.config.image_dependence_margin})"
@@ -213,6 +214,29 @@ class EarthFormerTrainer:
         )
         return baseline + model_output
 
+    def auxiliary_features_from_batch(
+        self,
+        batch: dict[str, object],
+        batch_index: int | None = None,
+    ) -> torch.Tensor | None:
+        """Return auxiliary readout-conditioning features when enabled."""
+        if not self.config.use_auxiliary_features:
+            return None
+        value = batch.get("auxiliary_features", batch.get("aux_features"))
+        if not isinstance(value, torch.Tensor):
+            raise KeyError(
+                "Auxiliary features are enabled, but the batch does not contain "
+                "'auxiliary_features'."
+            )
+        auxiliary = value.to(self.device, non_blocking=True).float()
+        assert_finite(
+            "auxiliary_features",
+            auxiliary,
+            batch=batch,
+            batch_index=-1 if batch_index is None else batch_index,
+        )
+        return auxiliary
+
     def set_backbone_trainability(self, epoch: int, announce: bool = True) -> None:
         """Freeze the EarthFormer backbone for the configured warm-start epochs."""
         should_freeze = self.config.freeze_earthformer or (
@@ -234,6 +258,7 @@ class EarthFormerTrainer:
         self,
         batch: dict[str, object],
         inputs: torch.Tensor,
+        auxiliary_features: torch.Tensor | None,
         predictions: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -243,7 +268,7 @@ class EarthFormerTrainer:
             return zero, zero
 
         zero_inputs = torch.zeros_like(inputs)
-        zero_outputs = self.model(zero_inputs)
+        zero_outputs = self.model(zero_inputs, auxiliary_features=auxiliary_features)
         zero_predictions = self.apply_forecast_mode(batch, zero_outputs)
         delta = (predictions - zero_predictions).abs()
         valid = valid_mask.to(device=predictions.device, dtype=torch.bool)
@@ -388,6 +413,10 @@ class EarthFormerTrainer:
             if valid_count == 0:
                 progress.set_postfix(loss="skip", valid="0.000")
                 continue
+            auxiliary_features = self.auxiliary_features_from_batch(
+                batch,
+                batch_index=batch_index,
+            )
             assert_finite("inputs", inputs, batch=batch, batch_index=batch_index)
             assert_finite("targets", targets, batch=batch, batch_index=batch_index)
             assert_finite(
@@ -408,7 +437,10 @@ class EarthFormerTrainer:
                 enabled=self.use_amp,
                 dtype=self.amp_dtype,
             ):
-                model_outputs = self.model(inputs)
+                model_outputs = self.model(
+                    inputs,
+                    auxiliary_features=auxiliary_features,
+                )
                 predictions = self.apply_forecast_mode(batch, model_outputs)
                 if predictions.shape != targets.shape:
                     raise ValueError(
@@ -450,6 +482,7 @@ class EarthFormerTrainer:
                 image_dependence_weighted, image_delta = self.image_dependence_regularization(
                     batch=batch,
                     inputs=inputs,
+                    auxiliary_features=auxiliary_features,
                     predictions=predictions,
                     valid_mask=valid_mask,
                 )
@@ -629,6 +662,7 @@ class EarthFormerTrainer:
                 collect_predictions=True,
                 clear_sky_threshold=self.config.clear_sky_threshold,
                 prediction_transform=self.apply_forecast_mode,
+                use_auxiliary_features=self.config.use_auxiliary_features,
             )
             validation_loss = float(validation_metrics["val_loss"])
             query_stats, query_heatmap_path = self.query_similarity_diagnostics(epoch)
@@ -648,6 +682,7 @@ class EarthFormerTrainer:
             row = {
                 "epoch": epoch,
                 "fix_preset": self.config.fix_preset,
+                "use_auxiliary_features": int(self.config.use_auxiliary_features),
                 "loss_name": self.config.loss_name,
                 "forecast_mode": self.config.forecast_mode,
                 "residual_baseline": self.config.residual_baseline,
@@ -719,6 +754,7 @@ class EarthFormerTrainer:
             print(
                 f"Epoch {epoch:03d}\n"
                 f"Fix Preset: {self.config.fix_preset}\n"
+                f"Auxiliary Features: {self.config.use_auxiliary_features}\n"
                 f"Loss: {self.config.loss_name}\n"
                 f"Forecast Mode: {self.config.forecast_mode}\n"
                 f"Train Loss: {train_loss:.6f}\n"
@@ -817,6 +853,7 @@ class EarthFormerTrainer:
             clear_sky_ghi=clear_sky_ghi,
             clear_sky_threshold=self.config.clear_sky_threshold,
         )
+        auxiliary_features = self.auxiliary_features_from_batch(batch)
 
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -825,7 +862,10 @@ class EarthFormerTrainer:
             enabled=self.use_amp,
             dtype=self.amp_dtype,
         ):
-            model_output = self.model(inputs)
+            model_output = self.model(
+                inputs,
+                auxiliary_features=auxiliary_features,
+            )
             prediction = self.apply_forecast_mode(batch, model_output)
 
             loss = self.criterion(
@@ -841,6 +881,7 @@ class EarthFormerTrainer:
             image_dependence_weighted, _image_delta = self.image_dependence_regularization(
                 batch=batch,
                 inputs=inputs,
+                auxiliary_features=auxiliary_features,
                 predictions=prediction,
                 valid_mask=valid_mask,
             )
@@ -869,7 +910,11 @@ class EarthFormerTrainer:
                 # Check prediction finite status
                 with torch.no_grad():
                     try:
-                        trace = self.model(inputs, return_debug=True)
+                        trace = self.model(
+                            inputs,
+                            auxiliary_features=auxiliary_features,
+                            return_debug=True,
+                        )
                     except Exception as e_trace:
                         print("debug forward failed:", e_trace)
                         raise
@@ -993,6 +1038,7 @@ class EarthFormerTrainer:
                 )
                 if int(valid_mask.sum().detach().cpu()) == 0:
                     continue
+                auxiliary_features = self.auxiliary_features_from_batch(batch)
 
                 self.optimizer.zero_grad()
 
@@ -1002,7 +1048,10 @@ class EarthFormerTrainer:
                     dtype=self.amp_dtype,
                 ):
 
-                    model_output = self.model(inputs)
+                    model_output = self.model(
+                        inputs,
+                        auxiliary_features=auxiliary_features,
+                    )
                     prediction = self.apply_forecast_mode(batch, model_output)
 
                     loss = self.criterion(
@@ -1018,6 +1067,7 @@ class EarthFormerTrainer:
                     image_dependence_weighted, _image_delta = self.image_dependence_regularization(
                         batch=batch,
                         inputs=inputs,
+                        auxiliary_features=auxiliary_features,
                         predictions=prediction,
                         valid_mask=valid_mask,
                     )
@@ -1095,6 +1145,7 @@ class EarthFormerTrainer:
                 amp_dtype=self.amp_dtype,
                 clear_sky_threshold=self.config.clear_sky_threshold,
                 prediction_transform=self.apply_forecast_mode,
+                use_auxiliary_features=self.config.use_auxiliary_features,
             )
             val = float(val_metrics["val_loss"])
             query_stats, _query_heatmap_path = self.query_similarity_diagnostics(epoch)
@@ -1119,6 +1170,7 @@ class EarthFormerTrainer:
             self.logger.log(
                 epoch=epoch,
                 fix_preset=self.config.fix_preset,
+                use_auxiliary_features=int(self.config.use_auxiliary_features),
                 loss_name=self.config.loss_name,
                 forecast_mode=self.config.forecast_mode,
                 residual_baseline=self.config.residual_baseline,

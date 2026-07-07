@@ -115,6 +115,7 @@ def validate(
     collect_predictions: bool = False,
     clear_sky_threshold: float = 20.0,
     prediction_transform: Callable[[dict[str, Any], torch.Tensor], torch.Tensor] | None = None,
+    use_auxiliary_features: bool = False,
     **_: Any,
 ) -> dict[str, Any]:
     """Return validation loss, forecasting metrics, and optional prediction rows.
@@ -192,9 +193,27 @@ def validate(
             batch=batch,
             batch_index=batch_index,
         )
+        auxiliary_features = None
+        if use_auxiliary_features:
+            aux_value = batch.get("auxiliary_features", batch.get("aux_features"))
+            if not isinstance(aux_value, torch.Tensor):
+                raise KeyError(
+                    "Auxiliary features are enabled, but validation batch does not "
+                    "contain 'auxiliary_features'."
+                )
+            auxiliary_features = aux_value.to(device, non_blocking=True).float()
+            assert_finite(
+                "auxiliary_features",
+                auxiliary_features,
+                batch=batch,
+                batch_index=batch_index,
+            )
 
         with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
-            model_outputs = model(inputs)
+            model_outputs = model(
+                inputs,
+                auxiliary_features=auxiliary_features,
+            )
             predictions = (
                 prediction_transform(batch, model_outputs)
                 if prediction_transform is not None

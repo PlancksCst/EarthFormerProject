@@ -97,9 +97,14 @@ def main() -> None:
     )
     model = build_perceiver_readout_model(config).to(device)
     criterion = MSELoss(
+        loss_name=config.loss_name,
         low_csi_weight=config.low_csi_weight,
         low_csi_threshold=config.low_csi_threshold,
         ghi_loss_weight=config.ghi_loss_weight,
+        huber_beta=config.huber_beta,
+        cloudy_weight=config.cloudy_weight,
+        ramp_weight=config.ramp_weight,
+        lambda_corr=config.lambda_corr,
     )
     optimizer = AdamW(
         model.parameters(),
@@ -111,6 +116,12 @@ def main() -> None:
     model.train()
     batch = next(iter(loader))
     inputs = batch["satellite"].to(device, non_blocking=True)
+    auxiliary_features = None
+    if config.use_auxiliary_features:
+        aux_value = batch.get("auxiliary_features", batch.get("aux_features"))
+        if not isinstance(aux_value, torch.Tensor):
+            raise KeyError("Auxiliary features are enabled, but the batch has none.")
+        auxiliary_features = aux_value.to(device, non_blocking=True).float()
     targets = ensure_forecast_target(batch["target"]).to(device, non_blocking=True)
     clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(
         device,
@@ -148,7 +159,7 @@ def main() -> None:
 
     optimizer.zero_grad(set_to_none=True)
     with autocast_context(device=device, enabled=use_amp, dtype=amp_dtype):
-        predictions = model(inputs)
+        predictions = model(inputs, auxiliary_features=auxiliary_features)
         assert_finite("predictions", predictions, batch=batch, batch_index=0)
         predicted_ghi = reconstruct_ghi(predictions, clear_sky_ghi)
         assert_finite("predicted_ghi", predicted_ghi, batch=batch, batch_index=0)

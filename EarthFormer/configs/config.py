@@ -14,6 +14,17 @@ def project_root() -> Path:
 
 
 METADATA_FILENAMES = ("metadata.parquet", "dualet_metadata.parquet")
+DEFAULT_AUXILIARY_FEATURE_NAMES = (
+    "previous_day_csi",
+    "clear_sky_ghi_scaled",
+    "solar_elevation_scaled",
+    "latitude_scaled",
+    "longitude_scaled",
+    "hour_sin",
+    "hour_cos",
+    "dayofyear_sin",
+    "dayofyear_cos",
+)
 LOSS_CHOICES = (
     "masked_mse",
     "masked_mae",
@@ -30,7 +41,7 @@ RESIDUAL_BASELINE_CHOICES = (
     "hourly_climatology",
     "location_hour_climatology",
 )
-FIX_PRESET_CHOICES = ("none", "combined_residual")
+FIX_PRESET_CHOICES = ("none", "combined_residual", "combined_aux_residual")
 
 
 def has_metadata(path: Path) -> bool:
@@ -130,6 +141,11 @@ def discover_elevation_csv() -> Path:
     )
 
 
+def discover_locations_csv() -> Path:
+    """Discover station latitude/longitude metadata when available."""
+    return discover_cams_csv("locations.csv", "EARTHFORMER_LOCATIONS_CSV")
+
+
 @dataclass
 class TrainingConfig:
     """Runtime configuration for backbone fine-tuning."""
@@ -138,6 +154,7 @@ class TrainingConfig:
     metadata_filename: str | None = os.environ.get("EARTHFORMER_METADATA_FILE")
     hourly_csv: Path = field(default_factory=discover_hourly_csv)
     elevation_csv: Path = field(default_factory=discover_elevation_csv)
+    locations_csv: Path = field(default_factory=discover_locations_csv)
     batch_size: int = int(os.environ.get("EARTHFORMER_BATCH_SIZE", "8"))
     learning_rate: float = float(os.environ.get("EARTHFORMER_LR", "1e-4"))
     backbone_learning_rate: float = float(os.environ.get("EARTHFORMER_BACKBONE_LR", "1e-5"))
@@ -193,6 +210,8 @@ class TrainingConfig:
     num_attention_heads: int = int(os.environ.get("EARTHFORMER_READOUT_HEADS", "4"))
     readout_dropout: float = float(os.environ.get("EARTHFORMER_READOUT_DROPOUT", "0.1"))
     regression_hidden_dim: int = int(os.environ.get("EARTHFORMER_REGRESSION_HIDDEN", "32"))
+    use_auxiliary_features: bool = os.environ.get("EARTHFORMER_USE_AUX_FEATURES", "0") == "1"
+    auxiliary_feature_dim: int = len(DEFAULT_AUXILIARY_FEATURE_NAMES)
     use_hour_query_embedding: bool = os.environ.get("EARTHFORMER_USE_HOUR_QUERY_EMBEDDING", "1") != "0"
     query_hour_embedding_dim: int | None = None
     use_query_diversity_loss: bool = os.environ.get("EARTHFORMER_USE_QUERY_DIVERSITY_LOSS", "0") == "1"
@@ -224,6 +243,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata-filename", type=str, default=None)
     parser.add_argument("--hourly-csv", type=Path, default=None)
     parser.add_argument("--elevation-csv", type=Path, default=None)
+    parser.add_argument("--locations-csv", type=Path, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--backbone-learning-rate", type=float, default=None)
@@ -271,6 +291,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-attention-heads", type=int, default=None)
     parser.add_argument("--readout-dropout", type=float, default=None)
     parser.add_argument("--regression-hidden-dim", type=int, default=None)
+    parser.add_argument("--use-auxiliary-features", action="store_true")
+    parser.add_argument("--no-auxiliary-features", action="store_true")
     parser.add_argument("--use-hour-query-embedding", action="store_true")
     parser.add_argument("--no-hour-query-embedding", action="store_true")
     parser.add_argument("--query-hour-embedding-dim", type=int, default=None)
@@ -293,6 +315,7 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "metadata_filename": args.metadata_filename,
         "hourly_csv": args.hourly_csv,
         "elevation_csv": args.elevation_csv,
+        "locations_csv": args.locations_csv,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "backbone_learning_rate": args.backbone_learning_rate,
@@ -343,7 +366,7 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
     for key, value in overrides.items():
         if value is not None:
             setattr(cfg, key, value)
-    if cfg.fix_preset == "combined_residual":
+    if cfg.fix_preset in {"combined_residual", "combined_aux_residual"}:
         if args.forecast_mode is None:
             cfg.forecast_mode = "residual_climatology"
         if args.residual_baseline is None:
@@ -359,6 +382,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.use_hour_query_embedding = True
         cfg.use_query_diversity_loss = True
         cfg.freeze_earthformer = False
+        if cfg.fix_preset == "combined_aux_residual":
+            cfg.use_auxiliary_features = True
     if args.amp:
         cfg.mixed_precision = True
     if args.no_amp:
@@ -367,6 +392,10 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.head_learning_rate = args.learning_rate
     if args.no_normalize:
         cfg.normalize = False
+    if args.use_auxiliary_features:
+        cfg.use_auxiliary_features = True
+    if args.no_auxiliary_features:
+        cfg.use_auxiliary_features = False
     if args.use_hour_query_embedding:
         cfg.use_hour_query_embedding = True
     if args.no_hour_query_embedding:
