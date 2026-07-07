@@ -26,6 +26,7 @@ from configs.config import TrainingConfig, build_arg_parser, config_from_args  #
 from datasets.seviri_dataset import build_dataloader  # noqa: E402
 from models.model import build_perceiver_readout_model  # noqa: E402
 from training.checkpoint import load_checkpoint, resume_checkpoint, save_checkpoint  # noqa: E402
+from training.baselines import ClimatologyBaseline  # noqa: E402
 from training.debugging import (  # noqa: E402
     assert_finite,
     assert_gradients_finite,
@@ -121,10 +122,36 @@ class EarthFormerTrainer:
         )
 
         self.model = build_perceiver_readout_model(self.config).to(self.device)
+        self.backbone_frozen: bool | None = None
+        self.set_backbone_trainability(epoch=1, announce=False)
+        self.residual_baseline = self.build_residual_baseline()
         self.criterion = MSELoss(
+            loss_name=self.config.loss_name,
             low_csi_weight=self.config.low_csi_weight,
             low_csi_threshold=self.config.low_csi_threshold,
             ghi_loss_weight=self.config.ghi_loss_weight,
+            huber_beta=self.config.huber_beta,
+            cloudy_weight=self.config.cloudy_weight,
+            ramp_weight=self.config.ramp_weight,
+            lambda_corr=self.config.lambda_corr,
+        )
+        print(
+            "Training loss: "
+            f"{self.config.loss_name} "
+            f"(huber_beta={self.config.huber_beta}, "
+            f"cloudy_weight={self.config.cloudy_weight}, "
+            f"ramp_weight={self.config.ramp_weight}, "
+            f"lambda_corr={self.config.lambda_corr}, "
+            f"ghi_loss_weight={self.config.ghi_loss_weight})"
+        )
+        print(
+            "Forecast mode: "
+            f"fix_preset={self.config.fix_preset}, "
+            f"{self.config.forecast_mode} "
+            f"(residual_baseline={self.config.residual_baseline}, "
+            f"freeze_backbone_epochs={self.config.freeze_backbone_epochs}, "
+            f"image_dependence_weight={self.config.image_dependence_weight}, "
+            f"image_dependence_margin={self.config.image_dependence_margin})"
         )
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
@@ -148,6 +175,84 @@ class EarthFormerTrainer:
             checkpoint = load_checkpoint(self.config.resume_checkpoint, map_location="cpu")
             extra_state = checkpoint.get("extra_state", {}) if isinstance(checkpoint, dict) else {}
             self.patience_counter = int(extra_state.get("patience_counter", 0))
+
+    def build_residual_baseline(self) -> ClimatologyBaseline | None:
+        """Build the optional climatology baseline used for residual forecasting."""
+        if self.config.forecast_mode == "direct":
+            return None
+        if self.config.forecast_mode != "residual_climatology":
+            raise ValueError(f"Unsupported forecast_mode: {self.config.forecast_mode}")
+        print(
+            "Building residual climatology baseline from training split "
+            f"({self.config.residual_baseline})..."
+        )
+        baseline = ClimatologyBaseline.from_dataset(
+            dataset=self.train_loader.dataset,
+            output_length=self.config.output_length,
+            mode=self.config.residual_baseline,
+            clear_sky_threshold=self.config.clear_sky_threshold,
+        )
+        print(f"Residual baseline global CSI mean: {baseline.global_mean:.4f}")
+        return baseline
+
+    def apply_forecast_mode(
+        self,
+        batch: dict[str, object],
+        model_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Convert raw model output into final CSI prediction."""
+        if self.config.forecast_mode == "direct":
+            return model_output
+        if self.residual_baseline is None:
+            raise RuntimeError("Residual forecast mode requires a fitted residual baseline.")
+        baseline = self.residual_baseline.predict(
+            batch=batch,
+            horizon=model_output.shape[1],
+            device=model_output.device,
+            dtype=model_output.dtype,
+        )
+        return baseline + model_output
+
+    def set_backbone_trainability(self, epoch: int, announce: bool = True) -> None:
+        """Freeze the EarthFormer backbone for the configured warm-start epochs."""
+        should_freeze = self.config.freeze_earthformer or (
+            self.config.freeze_backbone_epochs > 0
+            and epoch <= self.config.freeze_backbone_epochs
+        )
+        if self.backbone_frozen is not None and self.backbone_frozen == should_freeze:
+            return
+        if should_freeze:
+            self.model.freeze_earthformer()
+        else:
+            self.model.unfreeze_earthformer()
+        self.backbone_frozen = should_freeze
+        if announce:
+            state = "frozen" if should_freeze else "trainable"
+            print(f"EarthFormer backbone is {state} at epoch {epoch}.")
+
+    def image_dependence_regularization(
+        self,
+        batch: dict[str, object],
+        inputs: torch.Tensor,
+        predictions: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encourage the forecast to change when image evidence is removed."""
+        if self.config.image_dependence_weight <= 0.0:
+            zero = predictions.new_zeros(())
+            return zero, zero
+
+        zero_inputs = torch.zeros_like(inputs)
+        zero_outputs = self.model(zero_inputs)
+        zero_predictions = self.apply_forecast_mode(batch, zero_outputs)
+        delta = (predictions - zero_predictions).abs()
+        valid = valid_mask.to(device=predictions.device, dtype=torch.bool)
+        if int(valid.sum().detach().cpu()) == 0:
+            zero = predictions.new_zeros(())
+            return zero, zero
+        mean_delta = delta[valid].mean()
+        penalty = torch.relu(predictions.new_tensor(self.config.image_dependence_margin) - mean_delta)
+        return self.config.image_dependence_weight * penalty, mean_delta.detach()
 
     def build_optimizer(self) -> AdamW:
         """Build AdamW with lower LR for EarthFormer and higher LR for readout."""
@@ -233,10 +338,13 @@ class EarthFormerTrainer:
 
     def train_one_epoch(self, epoch: int) -> float:
         """Run one training epoch and return average training loss."""
+        self.set_backbone_trainability(epoch)
         self.model.train()
         total_loss = 0.0
         total_csi_loss = 0.0
         total_ghi_loss = 0.0
+        total_image_dependence_loss = 0.0
+        total_image_delta = 0.0
         total_query_diversity_loss = 0.0
         total_valid_positions = 0
         total_positions = 0
@@ -300,7 +408,8 @@ class EarthFormerTrainer:
                 enabled=self.use_amp,
                 dtype=self.amp_dtype,
             ):
-                predictions = self.model(inputs)
+                model_outputs = self.model(inputs)
+                predictions = self.apply_forecast_mode(batch, model_outputs)
                 if predictions.shape != targets.shape:
                     raise ValueError(
                         "Prediction and target shapes differ: "
@@ -338,7 +447,13 @@ class EarthFormerTrainer:
                 query_diversity_weighted, query_diversity_raw = (
                     self.query_diversity_regularization(targets.shape[1])
                 )
-                loss = loss + query_diversity_weighted
+                image_dependence_weighted, image_delta = self.image_dependence_regularization(
+                    batch=batch,
+                    inputs=inputs,
+                    predictions=predictions,
+                    valid_mask=valid_mask,
+                )
+                loss = loss + query_diversity_weighted + image_dependence_weighted
                 assert_scalar_finite(
                     "loss",
                     loss,
@@ -378,12 +493,18 @@ class EarthFormerTrainer:
             total_loss += float(loss.item()) * valid_count
             total_csi_loss += float(csi_loss.detach().cpu()) * valid_count
             total_ghi_loss += float(ghi_loss.detach().cpu()) * valid_count
+            total_image_dependence_loss += (
+                float(image_dependence_weighted.detach().cpu()) * valid_count
+            )
+            total_image_delta += float(image_delta.detach().cpu()) * valid_count
             total_query_diversity_loss += float(query_diversity_raw.detach().cpu()) * valid_count
             total_valid_positions += valid_count
             progress.set_postfix(
                 loss=f"{loss.item():.5f}",
                 csi=f"{float(csi_loss.detach().cpu()):.5f}",
                 ghi=f"{float(ghi_loss.detach().cpu()):.5f}",
+                img=f"{float(image_dependence_weighted.detach().cpu()):.5f}",
+                dimg=f"{float(image_delta.detach().cpu()):.4f}",
                 qdiv=f"{float(query_diversity_raw.detach().cpu()):.4f}",
                 valid=f"{valid_count / max(targets.numel(), 1):.3f}",
                 grad=f"{float(gradient_stats['total_norm']):.3e}",
@@ -396,6 +517,8 @@ class EarthFormerTrainer:
             "train_loss": total_loss / total_valid_positions,
             "train_csi_loss": total_csi_loss / total_valid_positions,
             "train_ghi_loss": total_ghi_loss / total_valid_positions,
+            "train_image_dependence_loss": total_image_dependence_loss / total_valid_positions,
+            "train_image_delta": total_image_delta / total_valid_positions,
             "train_query_diversity_loss": total_query_diversity_loss / total_valid_positions,
             "train_valid_fraction": total_valid_positions / max(total_positions, 1),
         }
@@ -505,6 +628,7 @@ class EarthFormerTrainer:
                 amp_dtype=self.amp_dtype,
                 collect_predictions=True,
                 clear_sky_threshold=self.config.clear_sky_threshold,
+                prediction_transform=self.apply_forecast_mode,
             )
             validation_loss = float(validation_metrics["val_loss"])
             query_stats, query_heatmap_path = self.query_similarity_diagnostics(epoch)
@@ -523,9 +647,25 @@ class EarthFormerTrainer:
             self.save_validation_predictions(epoch, prediction_rows)
             row = {
                 "epoch": epoch,
+                "fix_preset": self.config.fix_preset,
+                "loss_name": self.config.loss_name,
+                "forecast_mode": self.config.forecast_mode,
+                "residual_baseline": self.config.residual_baseline,
+                "huber_beta": float(self.config.huber_beta),
+                "cloudy_weight": float(self.config.cloudy_weight),
+                "ramp_weight": float(self.config.ramp_weight),
+                "lambda_corr": float(self.config.lambda_corr),
+                "ghi_loss_weight": float(self.config.ghi_loss_weight),
+                "image_dependence_weight": float(self.config.image_dependence_weight),
+                "image_dependence_margin": float(self.config.image_dependence_margin),
+                "freeze_backbone_epochs": int(self.config.freeze_backbone_epochs),
                 "train_loss": float(train_loss),
                 "train_csi_loss": float(self.last_train_metrics.get("train_csi_loss", train_loss)),
                 "train_ghi_loss": float(self.last_train_metrics.get("train_ghi_loss", 0.0)),
+                "train_image_dependence_loss": float(
+                    self.last_train_metrics.get("train_image_dependence_loss", 0.0)
+                ),
+                "train_image_delta": float(self.last_train_metrics.get("train_image_delta", 0.0)),
                 "train_query_diversity_loss": float(
                     self.last_train_metrics.get("train_query_diversity_loss", 0.0)
                 ),
@@ -578,9 +718,16 @@ class EarthFormerTrainer:
                 self.save_best_epoch_artifacts(plot_paths)
             print(
                 f"Epoch {epoch:03d}\n"
+                f"Fix Preset: {self.config.fix_preset}\n"
+                f"Loss: {self.config.loss_name}\n"
+                f"Forecast Mode: {self.config.forecast_mode}\n"
                 f"Train Loss: {train_loss:.6f}\n"
                 f"Train CSI Loss: {self.last_train_metrics.get('train_csi_loss', train_loss):.6f}\n"
                 f"Train GHI Loss: {self.last_train_metrics.get('train_ghi_loss', 0.0):.6f}\n"
+                f"Image Dependence Loss: "
+                f"{self.last_train_metrics.get('train_image_dependence_loss', 0.0):.6f}\n"
+                f"Image Delta real-vs-zero: "
+                f"{self.last_train_metrics.get('train_image_delta', 0.0):.6f}\n"
                 f"Query Diversity Loss: {self.last_train_metrics.get('train_query_diversity_loss', 0.0):.6f}\n"
                 f"Validation Loss: {validation_loss:.6f}\n"
                 f"Validation CSI Loss: {validation_metrics['val_csi_loss']:.6f}\n"
@@ -678,7 +825,8 @@ class EarthFormerTrainer:
             enabled=self.use_amp,
             dtype=self.amp_dtype,
         ):
-            prediction = self.model(inputs)
+            model_output = self.model(inputs)
+            prediction = self.apply_forecast_mode(batch, model_output)
 
             loss = self.criterion(
                 prediction,
@@ -690,7 +838,13 @@ class EarthFormerTrainer:
             query_diversity_weighted, _query_diversity_raw = (
                 self.query_diversity_regularization(targets.shape[1])
             )
-            loss = loss + query_diversity_weighted
+            image_dependence_weighted, _image_delta = self.image_dependence_regularization(
+                batch=batch,
+                inputs=inputs,
+                predictions=prediction,
+                valid_mask=valid_mask,
+            )
+            loss = loss + query_diversity_weighted + image_dependence_weighted
 
         print(f"Loss: {loss.item():.6f}")
 
@@ -848,7 +1002,8 @@ class EarthFormerTrainer:
                     dtype=self.amp_dtype,
                 ):
 
-                    prediction = self.model(inputs)
+                    model_output = self.model(inputs)
+                    prediction = self.apply_forecast_mode(batch, model_output)
 
                     loss = self.criterion(
                         prediction,
@@ -860,7 +1015,13 @@ class EarthFormerTrainer:
                     query_diversity_weighted, _query_diversity_raw = (
                         self.query_diversity_regularization(targets.shape[1])
                     )
-                    loss = loss + query_diversity_weighted
+                    image_dependence_weighted, _image_delta = self.image_dependence_regularization(
+                        batch=batch,
+                        inputs=inputs,
+                        predictions=prediction,
+                        valid_mask=valid_mask,
+                    )
+                    loss = loss + query_diversity_weighted + image_dependence_weighted
 
                 self.scaler.scale(loss).backward()
 
@@ -933,6 +1094,7 @@ class EarthFormerTrainer:
                 use_amp=self.use_amp,
                 amp_dtype=self.amp_dtype,
                 clear_sky_threshold=self.config.clear_sky_threshold,
+                prediction_transform=self.apply_forecast_mode,
             )
             val = float(val_metrics["val_loss"])
             query_stats, _query_heatmap_path = self.query_similarity_diagnostics(epoch)
@@ -956,9 +1118,26 @@ class EarthFormerTrainer:
 
             self.logger.log(
                 epoch=epoch,
+                fix_preset=self.config.fix_preset,
+                loss_name=self.config.loss_name,
+                forecast_mode=self.config.forecast_mode,
+                residual_baseline=self.config.residual_baseline,
+                huber_beta=float(self.config.huber_beta),
+                cloudy_weight=float(self.config.cloudy_weight),
+                ramp_weight=float(self.config.ramp_weight),
+                lambda_corr=float(self.config.lambda_corr),
+                ghi_loss_weight=float(self.config.ghi_loss_weight),
+                image_dependence_weight=float(self.config.image_dependence_weight),
+                image_dependence_margin=float(self.config.image_dependence_margin),
+                freeze_backbone_epochs=int(self.config.freeze_backbone_epochs),
                 train_loss=train,
                 train_csi_loss=self.last_train_metrics.get("train_csi_loss", train),
                 train_ghi_loss=self.last_train_metrics.get("train_ghi_loss", 0.0),
+                train_image_dependence_loss=self.last_train_metrics.get(
+                    "train_image_dependence_loss",
+                    0.0,
+                ),
+                train_image_delta=self.last_train_metrics.get("train_image_delta", 0.0),
                 train_query_diversity_loss=self.last_train_metrics.get(
                     "train_query_diversity_loss",
                     0.0,

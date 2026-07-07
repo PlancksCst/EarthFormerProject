@@ -114,6 +114,7 @@ def validate(
     amp_dtype: torch.dtype | None = None,
     collect_predictions: bool = False,
     clear_sky_threshold: float = 20.0,
+    prediction_transform: Callable[[dict[str, Any], torch.Tensor], torch.Tensor] | None = None,
     **_: Any,
 ) -> dict[str, Any]:
     """Return validation loss, forecasting metrics, and optional prediction rows.
@@ -193,7 +194,12 @@ def validate(
         )
 
         with autocast_context(device=device, enabled=amp_enabled, dtype=amp_dtype):
-            predictions = model(inputs)
+            model_outputs = model(inputs)
+            predictions = (
+                prediction_transform(batch, model_outputs)
+                if prediction_transform is not None
+                else model_outputs
+            )
             if predictions.shape != targets.shape:
                 raise ValueError(
                     "Prediction and target shapes differ: "

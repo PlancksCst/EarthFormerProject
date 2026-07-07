@@ -14,6 +14,23 @@ def project_root() -> Path:
 
 
 METADATA_FILENAMES = ("metadata.parquet", "dualet_metadata.parquet")
+LOSS_CHOICES = (
+    "masked_mse",
+    "masked_mae",
+    "masked_huber",
+    "masked_weighted_mse",
+    "masked_weighted_huber",
+    "masked_ramp_weighted_mse",
+    "masked_hybrid_mse_correlation",
+    "masked_hybrid_huber_correlation",
+)
+FORECAST_MODE_CHOICES = ("direct", "residual_climatology")
+RESIDUAL_BASELINE_CHOICES = (
+    "global_mean",
+    "hourly_climatology",
+    "location_hour_climatology",
+)
+FIX_PRESET_CHOICES = ("none", "combined_residual")
 
 
 def has_metadata(path: Path) -> bool:
@@ -142,6 +159,20 @@ class TrainingConfig:
     scheduler_t_max: int | None = None
     scheduler_eta_min: float = float(os.environ.get("EARTHFORMER_ETA_MIN", "1e-6"))
     clear_sky_threshold: float = float(os.environ.get("EARTHFORMER_CLEAR_SKY_THRESHOLD", "20.0"))
+    fix_preset: str = os.environ.get("EARTHFORMER_FIX_PRESET", "none")
+    forecast_mode: str = os.environ.get("EARTHFORMER_FORECAST_MODE", "direct")
+    residual_baseline: str = os.environ.get(
+        "EARTHFORMER_RESIDUAL_BASELINE",
+        "location_hour_climatology",
+    )
+    freeze_backbone_epochs: int = int(os.environ.get("EARTHFORMER_FREEZE_BACKBONE_EPOCHS", "0"))
+    image_dependence_weight: float = float(os.environ.get("EARTHFORMER_IMAGE_DEP_WEIGHT", "0.0"))
+    image_dependence_margin: float = float(os.environ.get("EARTHFORMER_IMAGE_DEP_MARGIN", "0.05"))
+    loss_name: str = os.environ.get("EARTHFORMER_LOSS", "masked_mse")
+    huber_beta: float = float(os.environ.get("EARTHFORMER_HUBER_BETA", "0.1"))
+    cloudy_weight: float = float(os.environ.get("EARTHFORMER_CLOUDY_WEIGHT", "1.0"))
+    ramp_weight: float = float(os.environ.get("EARTHFORMER_RAMP_WEIGHT", "1.0"))
+    lambda_corr: float = float(os.environ.get("EARTHFORMER_LAMBDA_CORR", "0.1"))
     low_csi_weight: float = float(os.environ.get("EARTHFORMER_LOW_CSI_WEIGHT", "2.0"))
     low_csi_threshold: float = float(os.environ.get("EARTHFORMER_LOW_CSI_THRESHOLD", "0.7"))
     ghi_loss_weight: float = float(os.environ.get("EARTHFORMER_GHI_LOSS_WEIGHT", "0.1"))
@@ -215,6 +246,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-t-max", type=int, default=None)
     parser.add_argument("--scheduler-eta-min", type=float, default=None)
     parser.add_argument("--clear-sky-threshold", type=float, default=None)
+    parser.add_argument("--fix-preset", choices=FIX_PRESET_CHOICES, default=None)
+    parser.add_argument("--forecast-mode", choices=FORECAST_MODE_CHOICES, default=None)
+    parser.add_argument("--residual-baseline", choices=RESIDUAL_BASELINE_CHOICES, default=None)
+    parser.add_argument("--freeze-backbone-epochs", type=int, default=None)
+    parser.add_argument("--image-dependence-weight", type=float, default=None)
+    parser.add_argument("--image-dependence-margin", type=float, default=None)
+    parser.add_argument("--loss", dest="loss_name", choices=LOSS_CHOICES, default=None)
+    parser.add_argument("--huber-beta", type=float, default=None)
+    parser.add_argument("--cloudy-weight", type=float, default=None)
+    parser.add_argument("--ramp-weight", type=float, default=None)
+    parser.add_argument("--lambda-corr", type=float, default=None)
     parser.add_argument("--low-csi-weight", type=float, default=None)
     parser.add_argument("--low-csi-threshold", type=float, default=None)
     parser.add_argument("--ghi-loss-weight", type=float, default=None)
@@ -271,6 +313,17 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "scheduler_t_max": args.scheduler_t_max,
         "scheduler_eta_min": args.scheduler_eta_min,
         "clear_sky_threshold": args.clear_sky_threshold,
+        "fix_preset": args.fix_preset,
+        "forecast_mode": args.forecast_mode,
+        "residual_baseline": args.residual_baseline,
+        "freeze_backbone_epochs": args.freeze_backbone_epochs,
+        "image_dependence_weight": args.image_dependence_weight,
+        "image_dependence_margin": args.image_dependence_margin,
+        "loss_name": args.loss_name,
+        "huber_beta": args.huber_beta,
+        "cloudy_weight": args.cloudy_weight,
+        "ramp_weight": args.ramp_weight,
+        "lambda_corr": args.lambda_corr,
         "low_csi_weight": args.low_csi_weight,
         "low_csi_threshold": args.low_csi_threshold,
         "ghi_loss_weight": args.ghi_loss_weight,
@@ -290,6 +343,22 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
     for key, value in overrides.items():
         if value is not None:
             setattr(cfg, key, value)
+    if cfg.fix_preset == "combined_residual":
+        if args.forecast_mode is None:
+            cfg.forecast_mode = "residual_climatology"
+        if args.residual_baseline is None:
+            cfg.residual_baseline = "location_hour_climatology"
+        if args.image_dependence_weight is None:
+            cfg.image_dependence_weight = 0.05
+        if args.image_dependence_margin is None:
+            cfg.image_dependence_margin = 0.05
+        if args.freeze_backbone_epochs is None:
+            cfg.freeze_backbone_epochs = 0
+        if args.query_diversity_weight is None:
+            cfg.query_diversity_weight = 0.01
+        cfg.use_hour_query_embedding = True
+        cfg.use_query_diversity_loss = True
+        cfg.freeze_earthformer = False
     if args.amp:
         cfg.mixed_precision = True
     if args.no_amp:
