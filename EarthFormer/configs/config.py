@@ -41,7 +41,18 @@ RESIDUAL_BASELINE_CHOICES = (
     "hourly_climatology",
     "location_hour_climatology",
 )
-FIX_PRESET_CHOICES = ("none", "combined_residual", "combined_aux_residual")
+FIX_PRESET_CHOICES = (
+    "none",
+    "combined_residual",
+    "combined_aux_residual",
+    "explicit_residual_head",
+    "explicit_residual_gated",
+)
+RESIDUAL_LOSS_CHOICES = (
+    "masked_residual_huber",
+    "masked_residual_weighted_huber",
+    "masked_residual_ramp_weighted_huber",
+)
 
 
 def has_metadata(path: Path) -> bool:
@@ -186,9 +197,14 @@ class TrainingConfig:
     image_dependence_weight: float = float(os.environ.get("EARTHFORMER_IMAGE_DEP_WEIGHT", "0.0"))
     image_dependence_margin: float = float(os.environ.get("EARTHFORMER_IMAGE_DEP_MARGIN", "0.05"))
     loss_name: str = os.environ.get("EARTHFORMER_LOSS", "masked_mse")
+    residual_loss: str = os.environ.get(
+        "EARTHFORMER_RESIDUAL_LOSS",
+        "masked_residual_weighted_huber",
+    )
     huber_beta: float = float(os.environ.get("EARTHFORMER_HUBER_BETA", "0.1"))
     cloudy_weight: float = float(os.environ.get("EARTHFORMER_CLOUDY_WEIGHT", "1.0"))
     ramp_weight: float = float(os.environ.get("EARTHFORMER_RAMP_WEIGHT", "1.0"))
+    residual_scale: float = float(os.environ.get("EARTHFORMER_RESIDUAL_SCALE", "0.3"))
     lambda_corr: float = float(os.environ.get("EARTHFORMER_LAMBDA_CORR", "0.1"))
     low_csi_weight: float = float(os.environ.get("EARTHFORMER_LOW_CSI_WEIGHT", "2.0"))
     low_csi_threshold: float = float(os.environ.get("EARTHFORMER_LOW_CSI_THRESHOLD", "0.7"))
@@ -240,6 +256,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line parser used by training and inference scripts."""
     parser = argparse.ArgumentParser(description="Fine-tune EarthFormer on SEVIRI imagery.")
     parser.add_argument("--dataset-root", type=Path, default=None)
+    parser.add_argument("--train-split", type=str, default=None)
+    parser.add_argument("--val-split", type=str, default=None)
     parser.add_argument("--metadata-filename", type=str, default=None)
     parser.add_argument("--hourly-csv", type=Path, default=None)
     parser.add_argument("--elevation-csv", type=Path, default=None)
@@ -255,6 +273,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", type=Path, default=None)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--pretrained-checkpoint", type=Path, default=None)
+    parser.add_argument("--pretrained-earthformer-checkpoint", type=Path, default=None)
     parser.add_argument("--resume-checkpoint", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--amp", action="store_true")
@@ -273,9 +292,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-dependence-weight", type=float, default=None)
     parser.add_argument("--image-dependence-margin", type=float, default=None)
     parser.add_argument("--loss", dest="loss_name", choices=LOSS_CHOICES, default=None)
+    parser.add_argument("--residual-loss", choices=RESIDUAL_LOSS_CHOICES, default=None)
     parser.add_argument("--huber-beta", type=float, default=None)
     parser.add_argument("--cloudy-weight", type=float, default=None)
     parser.add_argument("--ramp-weight", type=float, default=None)
+    parser.add_argument("--residual-scale", type=float, default=None)
     parser.add_argument("--lambda-corr", type=float, default=None)
     parser.add_argument("--low-csi-weight", type=float, default=None)
     parser.add_argument("--low-csi-threshold", type=float, default=None)
@@ -300,6 +321,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-query-diversity-loss", action="store_true")
     parser.add_argument("--query-diversity-weight", type=float, default=None)
     parser.add_argument("--freeze-earthformer", action="store_true")
+    parser.add_argument("--freeze-backbone", action="store_true")
+    parser.add_argument("--unfreeze-backbone", action="store_true")
     parser.add_argument("--no-artifact-mirror", action="store_true")
     return parser
 
@@ -312,6 +335,8 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
 
     overrides = {
         "dataset_root": args.dataset_root,
+        "train_split": args.train_split,
+        "val_split": args.val_split,
         "metadata_filename": args.metadata_filename,
         "hourly_csv": args.hourly_csv,
         "elevation_csv": args.elevation_csv,
@@ -326,7 +351,7 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "device": args.device,
         "checkpoint_dir": args.checkpoint_dir,
         "output_dir": args.output_dir,
-        "pretrained_checkpoint": args.pretrained_checkpoint,
+        "pretrained_checkpoint": args.pretrained_checkpoint or args.pretrained_earthformer_checkpoint,
         "resume_checkpoint": args.resume_checkpoint,
         "random_seed": args.seed,
         "amp_dtype": args.amp_dtype,
@@ -343,9 +368,11 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         "image_dependence_weight": args.image_dependence_weight,
         "image_dependence_margin": args.image_dependence_margin,
         "loss_name": args.loss_name,
+        "residual_loss": args.residual_loss,
         "huber_beta": args.huber_beta,
         "cloudy_weight": args.cloudy_weight,
         "ramp_weight": args.ramp_weight,
+        "residual_scale": args.residual_scale,
         "lambda_corr": args.lambda_corr,
         "low_csi_weight": args.low_csi_weight,
         "low_csi_threshold": args.low_csi_threshold,
@@ -384,6 +411,21 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.freeze_earthformer = False
         if cfg.fix_preset == "combined_aux_residual":
             cfg.use_auxiliary_features = True
+    if cfg.fix_preset in {"explicit_residual_head", "explicit_residual_gated"}:
+        if args.forecast_mode is None:
+            cfg.forecast_mode = "residual_climatology"
+        if args.residual_baseline is None:
+            cfg.residual_baseline = "location_hour_climatology"
+        if args.residual_loss is None:
+            cfg.residual_loss = "masked_residual_weighted_huber"
+        cfg.ghi_loss_weight = 0.0
+        cfg.image_dependence_weight = 0.0
+        cfg.use_query_diversity_loss = False
+        cfg.query_diversity_weight = 0.0
+        cfg.use_hour_query_embedding = False
+        cfg.freeze_earthformer = True
+        if cfg.fix_preset == "explicit_residual_gated":
+            cfg.use_auxiliary_features = True
     if args.amp:
         cfg.mixed_precision = True
     if args.no_amp:
@@ -406,8 +448,10 @@ def config_from_args(args: argparse.Namespace | None = None) -> TrainingConfig:
         cfg.use_query_diversity_loss = False
     elif args.query_diversity_weight is not None and args.query_diversity_weight > 0.0:
         cfg.use_query_diversity_loss = True
-    if args.freeze_earthformer:
+    if args.freeze_earthformer or args.freeze_backbone:
         cfg.freeze_earthformer = True
+    if args.unfreeze_backbone:
+        cfg.freeze_earthformer = False
     if args.no_artifact_mirror:
         cfg.mirror_artifacts = False
     return cfg

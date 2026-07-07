@@ -22,6 +22,10 @@ from earthformer_migration.model import (  # noqa: E402
     ensure_sevir_pretrained_checkpoint,
     load_sevir_pretrained_weights,
 )
+from models.explicit_residual_model import (  # noqa: E402
+    ExplicitResidualGatedModel,
+    ExplicitResidualModel,
+)
 from models.perceiver_model import EarthFormerPerceiverReadoutModel  # noqa: E402
 from readout import PerceiverReadout  # noqa: E402
 
@@ -47,6 +51,29 @@ def build_training_model(config: TrainingConfig) -> EarthFormerSEVIRIMigration:
 def build_perceiver_readout_model(config: TrainingConfig) -> EarthFormerPerceiverReadoutModel:
     """Build EarthFormer with a Perceiver IO readout after `pre_head_latent`."""
     earthformer = build_training_model(config)
+    if config.fix_preset == "explicit_residual_head":
+        model = ExplicitResidualModel(
+            earthformer=earthformer,
+            output_length=config.output_length,
+            latent_dim=config.readout_latent_dim,
+            hidden_dim=config.regression_hidden_dim,
+            residual_scale=config.residual_scale,
+        )
+        if config.freeze_earthformer:
+            model.freeze_earthformer()
+        return model
+    if config.fix_preset == "explicit_residual_gated":
+        model = ExplicitResidualGatedModel(
+            earthformer=earthformer,
+            output_length=config.output_length,
+            latent_dim=config.readout_latent_dim,
+            hidden_dim=config.regression_hidden_dim,
+            residual_scale=config.residual_scale,
+            auxiliary_dim=config.auxiliary_feature_dim,
+        )
+        if config.freeze_earthformer:
+            model.freeze_earthformer()
+        return model
     num_queries = config.num_output_queries or config.output_length
     readout = PerceiverReadout(
         latent_dim=config.readout_latent_dim,

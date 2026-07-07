@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 import time
 import csv
+import json
 import math
 import shutil
 from pathlib import Path
@@ -34,6 +35,7 @@ from training.debugging import (  # noqa: E402
 )
 from training.losses import MSELoss  # noqa: E402
 from training.losses import valid_hour_mask  # noqa: E402
+from training.residual_losses import ResidualLoss  # noqa: E402
 from training.validate import ensure_forecast_target, reconstruct_ghi, validate  # noqa: E402
 from utils.artifacts import ArtifactMirror  # noqa: E402
 from utils.logger import CSVLogger  # noqa: E402
@@ -125,6 +127,12 @@ class EarthFormerTrainer:
         self.backbone_frozen: bool | None = None
         self.set_backbone_trainability(epoch=1, announce=False)
         self.residual_baseline = self.build_residual_baseline()
+        self.residual_criterion = ResidualLoss(
+            loss_name=self.config.residual_loss,
+            beta=self.config.huber_beta,
+            cloudy_weight=self.config.cloudy_weight,
+            ramp_weight=self.config.ramp_weight,
+        )
         self.criterion = MSELoss(
             loss_name=self.config.loss_name,
             low_csi_weight=self.config.low_csi_weight,
@@ -138,7 +146,8 @@ class EarthFormerTrainer:
         print(
             "Training loss: "
             f"{self.config.loss_name} "
-            f"(huber_beta={self.config.huber_beta}, "
+            f"(residual_loss={self.config.residual_loss}, "
+            f"huber_beta={self.config.huber_beta}, "
             f"cloudy_weight={self.config.cloudy_weight}, "
             f"ramp_weight={self.config.ramp_weight}, "
             f"lambda_corr={self.config.lambda_corr}, "
@@ -176,6 +185,10 @@ class EarthFormerTrainer:
             checkpoint = load_checkpoint(self.config.resume_checkpoint, map_location="cpu")
             extra_state = checkpoint.get("extra_state", {}) if isinstance(checkpoint, dict) else {}
             self.patience_counter = int(extra_state.get("patience_counter", 0))
+
+    def is_explicit_residual_preset(self) -> bool:
+        """Return whether the active preset uses explicit residual learning."""
+        return self.config.fix_preset in {"explicit_residual_head", "explicit_residual_gated"}
 
     def build_residual_baseline(self) -> ClimatologyBaseline | None:
         """Build the optional climatology baseline used for residual forecasting."""
@@ -363,6 +376,8 @@ class EarthFormerTrainer:
 
     def train_one_epoch(self, epoch: int) -> float:
         """Run one training epoch and return average training loss."""
+        if self.is_explicit_residual_preset():
+            return self.train_one_explicit_residual_epoch(epoch)
         self.set_backbone_trainability(epoch)
         self.model.train()
         total_loss = 0.0
@@ -557,6 +572,117 @@ class EarthFormerTrainer:
         }
         return self.last_train_metrics["train_loss"]
 
+    def train_one_explicit_residual_epoch(self, epoch: int) -> float:
+        """Run one epoch training only residual predictions against residual targets."""
+        if self.residual_baseline is None:
+            raise RuntimeError("Explicit residual training requires a climatology baseline.")
+        self.set_backbone_trainability(epoch)
+        self.model.train()
+        total_loss = 0.0
+        total_residual_rmse_num = 0.0
+        total_valid_positions = 0
+        total_positions = 0
+        progress = tqdm(self.train_loader, desc=f"Residual {epoch}/{self.config.epochs}", leave=False)
+
+        for batch_index, batch in enumerate(progress):
+            inputs = batch["satellite"].to(self.device, non_blocking=True)
+            targets = ensure_forecast_target(batch["target"]).to(self.device, non_blocking=True)
+            clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(
+                self.device,
+                non_blocking=True,
+            )
+            target_mask = batch.get("target_mask")
+            if isinstance(target_mask, torch.Tensor):
+                target_mask = target_mask.to(self.device, non_blocking=True)
+            valid_mask = valid_hour_mask(
+                target_mask=target_mask,
+                reference=targets,
+                clear_sky_ghi=clear_sky_ghi,
+                clear_sky_threshold=self.config.clear_sky_threshold,
+            )
+            valid_count = int(valid_mask.sum().detach().cpu())
+            total_positions += int(targets.numel())
+            if valid_count == 0:
+                progress.set_postfix(loss="skip", valid="0.000")
+                continue
+
+            auxiliary_features = self.auxiliary_features_from_batch(batch, batch_index=batch_index)
+            baseline_csi = self.residual_baseline.predict(
+                batch=batch,
+                horizon=targets.shape[1],
+                device=self.device,
+                dtype=targets.dtype,
+            )
+            target_residual = targets - baseline_csi
+            self.optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device=self.device, enabled=self.use_amp, dtype=self.amp_dtype):
+                result = self.model(
+                    inputs,
+                    auxiliary_features=auxiliary_features,
+                    return_components=True,
+                )
+                pred_residual = result["pred_residual"] if isinstance(result, dict) else result
+                if pred_residual.shape != targets.shape:
+                    raise ValueError(
+                        "Residual prediction and target shapes differ: "
+                        f"{tuple(pred_residual.shape)} vs {tuple(targets.shape)}"
+                    )
+                loss = self.residual_criterion(
+                    pred_residual,
+                    target_residual,
+                    valid_mask=valid_mask,
+                    target_csi=targets,
+                )
+                assert_scalar_finite("residual_loss", loss, batch=batch, batch_index=batch_index)
+
+            self.scaler.scale(loss).backward()
+            if self.config.gradient_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                gradient_stats = assert_gradients_finite(
+                    self.model,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
+                if not isinstance(grad_norm, torch.Tensor):
+                    grad_norm = torch.tensor(float(grad_norm), device=self.device)
+                assert_scalar_finite("gradient_norm", grad_norm.detach().reshape(()), batch=batch, batch_index=batch_index)
+            else:
+                gradient_stats = assert_gradients_finite(
+                    self.model,
+                    batch=batch,
+                    batch_index=batch_index,
+                )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            with torch.no_grad():
+                squared = (pred_residual.detach() - target_residual).pow(2)
+                total_residual_rmse_num += float(squared[valid_mask].sum().detach().cpu())
+            total_loss += float(loss.item()) * valid_count
+            total_valid_positions += valid_count
+            progress.set_postfix(
+                loss=f"{loss.item():.5f}",
+                valid=f"{valid_count / max(targets.numel(), 1):.3f}",
+                grad=f"{float(gradient_stats['total_norm']):.3e}",
+                lr=f"{self.current_lr():.3e}",
+            )
+
+        if total_valid_positions == 0:
+            raise ValueError("Training dataloader produced no physically valid target hours")
+        residual_rmse = math.sqrt(total_residual_rmse_num / total_valid_positions)
+        self.last_train_metrics = {
+            "train_loss": total_loss / total_valid_positions,
+            "train_csi_loss": total_loss / total_valid_positions,
+            "train_ghi_loss": 0.0,
+            "train_image_dependence_loss": 0.0,
+            "train_image_delta": 0.0,
+            "train_query_diversity_loss": 0.0,
+            "train_valid_fraction": total_valid_positions / max(total_positions, 1),
+            "train_residual_CSI_RMSE": residual_rmse,
+        }
+        return self.last_train_metrics["train_loss"]
+
     def checkpoint_extra_state(self) -> dict[str, float | int | str]:
         """Return trainer state needed for exact early-stopping resume."""
         return {
@@ -611,7 +737,25 @@ class EarthFormerTrainer:
         prediction_dir = self.config.output_dir / "predictions"
         prediction_dir.mkdir(parents=True, exist_ok=True)
         path = prediction_dir / f"validation_epoch_{epoch:03d}.csv"
-        fieldnames = [
+        if rows and "baseline_csi" in rows[0]:
+            fieldnames = [
+                "sample_id",
+                "location",
+                "hour_index",
+                "target_csi",
+                "baseline_csi",
+                "target_residual",
+                "pred_residual",
+                "pred_csi",
+                "valid_mask",
+                "clear_sky_ghi",
+                "target_ghi",
+                "pred_ghi",
+            ]
+            if any("gate" in row for row in rows):
+                fieldnames.append("gate")
+        else:
+            fieldnames = [
             "sample_id",
             "location",
             "input_day",
@@ -626,15 +770,254 @@ class EarthFormerTrainer:
             "target_ghi",
             "predicted_ghi",
             "clear_sky_ghi",
-        ]
+            ]
         with path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
         latest_path = prediction_dir / "validation_latest.csv"
         shutil.copy2(path, latest_path)
+        if rows and "baseline_csi" in rows[0]:
+            explicit_path = prediction_dir / "prediction.csv"
+            shutil.copy2(path, explicit_path)
+            self.artifacts.mirror_output_file(explicit_path)
         self.artifacts.mirror_output_file(path)
         self.artifacts.mirror_output_file(latest_path)
+        return path
+
+    @staticmethod
+    def _metadata_value(batch: dict[str, object], key: str, index: int) -> object:
+        value = batch.get(key)
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            item = value[index]
+            return item.item() if item.numel() == 1 else item.detach().cpu().tolist()
+        if isinstance(value, (list, tuple)):
+            return value[index] if index < len(value) else None
+        return value
+
+    @staticmethod
+    def _rmse(prediction: torch.Tensor, target: torch.Tensor) -> float:
+        if prediction.numel() == 0:
+            return float("nan")
+        return float(torch.sqrt(torch.mean((prediction - target) ** 2)).item())
+
+    @staticmethod
+    def _pearson(prediction: torch.Tensor, target: torch.Tensor) -> float:
+        if prediction.numel() < 2:
+            return 0.0
+        pred = prediction.float() - prediction.float().mean()
+        tgt = target.float() - target.float().mean()
+        denom = torch.sqrt(pred.pow(2).sum().clamp_min(1.0e-12) * tgt.pow(2).sum().clamp_min(1.0e-12))
+        corr = (pred * tgt).sum() / denom
+        if not torch.isfinite(corr):
+            return 0.0
+        return float(corr.clamp(-1.0, 1.0).item())
+
+    @torch.no_grad()
+    def validate_explicit_residual(self) -> dict[str, object]:
+        """Validate explicit residual presets with baseline/residual diagnostics."""
+        if self.residual_baseline is None:
+            raise RuntimeError("Explicit residual validation requires a climatology baseline.")
+        self.model.eval()
+        total_loss = 0.0
+        total_valid_positions = 0
+        total_positions = 0
+        pred_csi_values: list[torch.Tensor] = []
+        baseline_csi_values: list[torch.Tensor] = []
+        target_csi_values: list[torch.Tensor] = []
+        pred_residual_values: list[torch.Tensor] = []
+        target_residual_values: list[torch.Tensor] = []
+        rows: list[dict[str, object]] = []
+        sample: dict[str, object] | None = None
+
+        for batch_index, batch in enumerate(self.val_loader):
+            inputs = batch["satellite"].to(self.device, non_blocking=True)
+            targets = ensure_forecast_target(batch["target"]).to(self.device, non_blocking=True)
+            clear_sky_ghi = ensure_forecast_target(batch["clear_sky_ghi"], "clear_sky_ghi").to(
+                self.device,
+                non_blocking=True,
+            )
+            target_ghi_value = batch.get("target_ghi")
+            if target_ghi_value is None:
+                target_ghi_tensor = reconstruct_ghi(targets, clear_sky_ghi)
+            else:
+                target_ghi_tensor = ensure_forecast_target(target_ghi_value, "target_ghi").to(
+                    self.device,
+                    non_blocking=True,
+                )
+            target_mask = batch.get("target_mask")
+            if isinstance(target_mask, torch.Tensor):
+                target_mask = target_mask.to(self.device, non_blocking=True)
+            valid_mask = valid_hour_mask(
+                target_mask=target_mask,
+                reference=targets,
+                clear_sky_ghi=clear_sky_ghi,
+                clear_sky_threshold=self.config.clear_sky_threshold,
+            )
+            valid_count = int(valid_mask.sum().detach().cpu())
+            total_positions += int(targets.numel())
+            auxiliary_features = self.auxiliary_features_from_batch(batch, batch_index=batch_index)
+            baseline_csi = self.residual_baseline.predict(
+                batch=batch,
+                horizon=targets.shape[1],
+                device=self.device,
+                dtype=targets.dtype,
+            )
+            target_residual = targets - baseline_csi
+
+            with autocast_context(device=self.device, enabled=self.use_amp, dtype=self.amp_dtype):
+                result = self.model(
+                    inputs,
+                    auxiliary_features=auxiliary_features,
+                    return_components=True,
+                )
+                pred_residual = result["pred_residual"] if isinstance(result, dict) else result
+                gate = result.get("gate") if isinstance(result, dict) else None
+                pred_csi = (baseline_csi + pred_residual).clamp(0.0, 1.3)
+                if valid_count > 0:
+                    loss = self.residual_criterion(
+                        pred_residual,
+                        target_residual,
+                        valid_mask=valid_mask,
+                        target_csi=targets,
+                    )
+                else:
+                    loss = pred_residual.new_zeros(())
+
+            pred_ghi = reconstruct_ghi(pred_csi, clear_sky_ghi)
+            if valid_count > 0:
+                total_loss += float(loss.item()) * valid_count
+                total_valid_positions += valid_count
+                valid_cpu = valid_mask.detach().cpu()
+                pred_csi_values.append(pred_csi.detach().cpu()[valid_cpu])
+                baseline_csi_values.append(baseline_csi.detach().cpu()[valid_cpu])
+                target_csi_values.append(targets.detach().cpu()[valid_cpu])
+                pred_residual_values.append(pred_residual.detach().cpu()[valid_cpu])
+                target_residual_values.append(target_residual.detach().cpu()[valid_cpu])
+
+            batch_size, horizon = targets.shape
+            cpu_tensors = {
+                "target": targets.detach().float().cpu(),
+                "baseline": baseline_csi.detach().float().cpu(),
+                "target_residual": target_residual.detach().float().cpu(),
+                "pred_residual": pred_residual.detach().float().cpu(),
+                "pred_csi": pred_csi.detach().float().cpu(),
+                "valid": valid_mask.detach().cpu().bool(),
+                "clear": clear_sky_ghi.detach().float().cpu(),
+                "target_ghi": target_ghi_tensor.detach().float().cpu(),
+                "pred_ghi": pred_ghi.detach().float().cpu(),
+                "gate": gate.detach().float().cpu() if isinstance(gate, torch.Tensor) else None,
+            }
+            for sample_index in range(batch_size):
+                for hour_index in range(horizon):
+                    row = {
+                        "sample_id": self._metadata_value(batch, "sample_id", sample_index),
+                        "location": self._metadata_value(batch, "location", sample_index),
+                        "hour_index": hour_index,
+                        "target_csi": float(cpu_tensors["target"][sample_index, hour_index]),
+                        "baseline_csi": float(cpu_tensors["baseline"][sample_index, hour_index]),
+                        "target_residual": float(cpu_tensors["target_residual"][sample_index, hour_index]),
+                        "pred_residual": float(cpu_tensors["pred_residual"][sample_index, hour_index]),
+                        "pred_csi": float(cpu_tensors["pred_csi"][sample_index, hour_index]),
+                        "valid_mask": bool(cpu_tensors["valid"][sample_index, hour_index]),
+                        "clear_sky_ghi": float(cpu_tensors["clear"][sample_index, hour_index]),
+                        "target_ghi": float(cpu_tensors["target_ghi"][sample_index, hour_index]),
+                        "pred_ghi": float(cpu_tensors["pred_ghi"][sample_index, hour_index]),
+                    }
+                    if cpu_tensors["gate"] is not None:
+                        row["gate"] = float(cpu_tensors["gate"][sample_index, hour_index])
+                    rows.append(row)
+
+            if sample is None:
+                sample = {
+                    "prediction_csi": pred_csi[0].detach().cpu(),
+                    "target_csi": targets[0].detach().cpu(),
+                    "prediction_ghi": pred_ghi[0].detach().cpu(),
+                    "target_ghi": target_ghi_tensor[0].detach().cpu(),
+                    "clear_sky_ghi": clear_sky_ghi[0].detach().cpu(),
+                    "valid_mask": valid_mask[0].detach().cpu(),
+                    "sample_id": self._metadata_value(batch, "sample_id", 0),
+                    "location": self._metadata_value(batch, "location", 0),
+                    "input_day": self._metadata_value(batch, "input_day", 0),
+                    "target_day": self._metadata_value(batch, "target_day", 0),
+                }
+
+        if total_valid_positions == 0:
+            raise ValueError("Validation dataloader produced no physically valid target hours")
+
+        all_pred_csi = torch.cat(pred_csi_values)
+        all_baseline_csi = torch.cat(baseline_csi_values)
+        all_target_csi = torch.cat(target_csi_values)
+        all_pred_residual = torch.cat(pred_residual_values)
+        all_target_residual = torch.cat(target_residual_values)
+        baseline_rmse = self._rmse(all_baseline_csi, all_target_csi)
+        final_rmse = self._rmse(all_pred_csi, all_target_csi)
+        residual_rmse = self._rmse(all_pred_residual, all_target_residual)
+        target_residual_std = float(all_target_residual.std(unbiased=False).item())
+        pred_residual_std = float(all_pred_residual.std(unbiased=False).item())
+        residual_std_ratio = pred_residual_std / max(target_residual_std, 1.0e-12)
+        residual_pearson = self._pearson(all_pred_residual, all_target_residual)
+        improvement = 100.0 * (baseline_rmse - final_rmse) / max(baseline_rmse, 1.0e-12)
+
+        metrics: dict[str, object] = {
+            "val_loss": total_loss / total_valid_positions,
+            "val_csi_loss": total_loss / total_valid_positions,
+            "val_ghi_loss": 0.0,
+            "valid_fraction": total_valid_positions / max(total_positions, 1),
+            "CSI_RMSE": final_rmse,
+            "CSI_MAE": float((all_pred_csi - all_target_csi).abs().mean().item()),
+            "CSI_nRMSE": final_rmse / max(float(all_target_csi.mean().abs().item()), 1.0e-12),
+            "CSI_R2": 1.0 - float(((all_pred_csi - all_target_csi) ** 2).sum().item())
+            / max(float(((all_target_csi - all_target_csi.mean()) ** 2).sum().item()), 1.0e-12),
+            "CSI_MBE": float((all_pred_csi - all_target_csi).mean().item()),
+            "GHI_MAE": 0.0,
+            "GHI_RMSE": 0.0,
+            "GHI_nRMSE": 0.0,
+            "GHI_R2": 0.0,
+            "GHI_MBE": 0.0,
+            "baseline_CSI_RMSE": baseline_rmse,
+            "final_CSI_RMSE": final_rmse,
+            "residual_CSI_RMSE": residual_rmse,
+            "residual_Pearson": residual_pearson,
+            "pred_residual_std": pred_residual_std,
+            "target_residual_std": target_residual_std,
+            "residual_std_ratio": residual_std_ratio,
+            "improvement_over_baseline_percent": improvement,
+            "predictions": rows,
+            "sample": sample,
+        }
+        self.save_explicit_residual_summary(metrics)
+        return metrics
+
+    def save_explicit_residual_summary(self, metrics: dict[str, object]) -> Path:
+        """Write the required explicit residual summary JSON."""
+        ratio = float(metrics["residual_std_ratio"])
+        pearson = float(metrics["residual_Pearson"])
+        improved = float(metrics["final_CSI_RMSE"]) < float(metrics["baseline_CSI_RMSE"])
+        active = ratio > 0.2 and pearson > 0.1
+        if improved and active:
+            interpretation = "satellite_residual_branch_active_and_improves_over_climatology"
+        elif active:
+            interpretation = "satellite_residual_branch_active_but_not_yet_improving_rmse"
+        else:
+            interpretation = "satellite_residual_branch_remains_inactive_or_near_mean"
+        summary = {
+            "baseline_CSI_RMSE": float(metrics["baseline_CSI_RMSE"]),
+            "final_CSI_RMSE": float(metrics["final_CSI_RMSE"]),
+            "improvement_over_baseline_percent": float(metrics["improvement_over_baseline_percent"]),
+            "residual_Pearson": pearson,
+            "pred_residual_std": float(metrics["pred_residual_std"]),
+            "target_residual_std": float(metrics["target_residual_std"]),
+            "residual_std_ratio": ratio,
+            "satellite_residual_active": bool(active),
+            "recommended_interpretation": interpretation,
+        }
+        path = self.config.output_dir / "explicit_residual_summary.json"
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, indent=2)
+        self.artifacts.mirror_output_file(path)
         return path
 
     def save_best_epoch_artifacts(self, plot_paths: dict[str, Path]) -> None:
@@ -652,20 +1035,27 @@ class EarthFormerTrainer:
         for epoch in range(self.start_epoch, self.config.epochs + 1):
             epoch_start = time.perf_counter()
             train_loss = self.train_one_epoch(epoch)
-            validation_metrics = validate(
-                model=self.model,
-                dataloader=self.val_loader,
-                criterion=self.criterion,
-                device=self.device,
-                use_amp=self.use_amp,
-                amp_dtype=self.amp_dtype,
-                collect_predictions=True,
-                clear_sky_threshold=self.config.clear_sky_threshold,
-                prediction_transform=self.apply_forecast_mode,
-                use_auxiliary_features=self.config.use_auxiliary_features,
-            )
+            if self.is_explicit_residual_preset():
+                validation_metrics = self.validate_explicit_residual()
+            else:
+                validation_metrics = validate(
+                    model=self.model,
+                    dataloader=self.val_loader,
+                    criterion=self.criterion,
+                    device=self.device,
+                    use_amp=self.use_amp,
+                    amp_dtype=self.amp_dtype,
+                    collect_predictions=True,
+                    clear_sky_threshold=self.config.clear_sky_threshold,
+                    prediction_transform=self.apply_forecast_mode,
+                    use_auxiliary_features=self.config.use_auxiliary_features,
+                )
             validation_loss = float(validation_metrics["val_loss"])
-            query_stats, query_heatmap_path = self.query_similarity_diagnostics(epoch)
+            if self.is_explicit_residual_preset():
+                query_stats = {"mean": 0.0, "min": 0.0, "max": 0.0}
+                query_heatmap_path = None
+            else:
+                query_stats, query_heatmap_path = self.query_similarity_diagnostics(epoch)
             lrs = self.current_lrs()
             improved = validation_loss < self.best_loss
             if improved:
@@ -719,6 +1109,16 @@ class EarthFormerTrainer:
                 "GHI_nRMSE": float(validation_metrics["GHI_nRMSE"]),
                 "GHI_R2": float(validation_metrics["GHI_R2"]),
                 "GHI_MBE": float(validation_metrics["GHI_MBE"]),
+                "baseline_CSI_RMSE": float(validation_metrics.get("baseline_CSI_RMSE", float("nan"))),
+                "final_CSI_RMSE": float(validation_metrics.get("final_CSI_RMSE", validation_metrics["CSI_RMSE"])),
+                "residual_CSI_RMSE": float(validation_metrics.get("residual_CSI_RMSE", float("nan"))),
+                "residual_Pearson": float(validation_metrics.get("residual_Pearson", float("nan"))),
+                "pred_residual_std": float(validation_metrics.get("pred_residual_std", float("nan"))),
+                "target_residual_std": float(validation_metrics.get("target_residual_std", float("nan"))),
+                "residual_std_ratio": float(validation_metrics.get("residual_std_ratio", float("nan"))),
+                "improvement_over_baseline_percent": float(
+                    validation_metrics.get("improvement_over_baseline_percent", float("nan"))
+                ),
                 "query_similarity_mean": float(query_stats["mean"]),
                 "query_similarity_min": float(query_stats["min"]),
                 "query_similarity_max": float(query_stats["max"]),
@@ -772,6 +1172,10 @@ class EarthFormerTrainer:
                 f"CSI RMSE: {validation_metrics['CSI_RMSE']:.6f}\n"
                 f"CSI MAE: {validation_metrics['CSI_MAE']:.6f}\n"
                 f"GHI RMSE: {validation_metrics['GHI_RMSE']:.6f}\n"
+                f"Baseline CSI RMSE: {float(validation_metrics.get('baseline_CSI_RMSE', float('nan'))):.6f}\n"
+                f"Final CSI RMSE: {float(validation_metrics.get('final_CSI_RMSE', validation_metrics['CSI_RMSE'])):.6f}\n"
+                f"Residual std ratio: {float(validation_metrics.get('residual_std_ratio', float('nan'))):.6f}\n"
+                f"Residual Pearson: {float(validation_metrics.get('residual_Pearson', float('nan'))):.6f}\n"
                 f"Query Similarity mean/min/max: "
                 f"{query_stats['mean']:.4f}/{query_stats['min']:.4f}/{query_stats['max']:.4f}\n"
                 f"LR backbone: {lrs.get('backbone', 0.0):.3e}\n"
@@ -866,15 +1270,31 @@ class EarthFormerTrainer:
                 inputs,
                 auxiliary_features=auxiliary_features,
             )
-            prediction = self.apply_forecast_mode(batch, model_output)
-
-            loss = self.criterion(
-                prediction,
-                targets,
-                valid_mask=valid_mask,
-                clear_sky_ghi=clear_sky_ghi,
-                target_ghi=target_ghi,
-            )
+            if self.is_explicit_residual_preset():
+                if self.residual_baseline is None:
+                    raise RuntimeError("Explicit residual one-batch test requires a baseline.")
+                baseline = self.residual_baseline.predict(
+                    batch=batch,
+                    horizon=targets.shape[1],
+                    device=self.device,
+                    dtype=targets.dtype,
+                )
+                prediction = (baseline + model_output).clamp(0.0, 1.3)
+                loss = self.residual_criterion(
+                    model_output,
+                    targets - baseline,
+                    valid_mask=valid_mask,
+                    target_csi=targets,
+                )
+            else:
+                prediction = self.apply_forecast_mode(batch, model_output)
+                loss = self.criterion(
+                    prediction,
+                    targets,
+                    valid_mask=valid_mask,
+                    clear_sky_ghi=clear_sky_ghi,
+                    target_ghi=target_ghi,
+                )
             query_diversity_weighted, _query_diversity_raw = (
                 self.query_diversity_regularization(targets.shape[1])
             )
