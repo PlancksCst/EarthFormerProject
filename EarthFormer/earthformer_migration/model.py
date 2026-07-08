@@ -189,13 +189,21 @@ def load_sevir_pretrained_weights(
     """Load official SEVIR weights, adapting only compatibility-forced tensors."""
     checkpoint_path = os.fspath(checkpoint_path)
     try:
-        raw_state = torch.load(
-            checkpoint_path,
-            map_location=map_location,
-            weights_only=True,
-        )
-    except TypeError:
-        raw_state = torch.load(checkpoint_path, map_location=map_location)
+        try:
+            raw_state = torch.load(
+                checkpoint_path,
+                map_location=map_location,
+                weights_only=True,
+            )
+        except TypeError:
+            raw_state = torch.load(checkpoint_path, map_location=map_location)
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load the EarthFormer SEVIR pretrained checkpoint. "
+            "The file is missing, incomplete, or corrupted. Delete it and rerun "
+            "so it can be downloaded again, or pass a valid checkpoint via "
+            f"--pretrained-earthformer-checkpoint/--pretrained-checkpoint. Path: {checkpoint_path}"
+        ) from exc
     if isinstance(raw_state, dict) and "state_dict" in raw_state:
         raw_state = raw_state["state_dict"]
 

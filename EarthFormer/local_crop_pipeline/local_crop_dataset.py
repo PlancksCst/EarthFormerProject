@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import inspect
+import importlib.util
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +18,30 @@ for path in (PROJECT_ROOT, PREP_MODELS_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from earthformer_migration.seviri_dataset import SEVIRIImageSequenceDataset  # noqa: E402
 from local_crop_pipeline.station_crop_mapping import (  # noqa: E402
     CropBounds,
     build_station_mapping,
     mapping_by_location,
 )
+
+
+def _load_project_seviri_dataset_class() -> type:
+    """Load the EarthFormer-local dataset adapter, avoiding duplicate package shadowing."""
+    module_path = PROJECT_ROOT / "earthformer_migration" / "seviri_dataset.py"
+    if not module_path.exists():
+        raise FileNotFoundError(f"Missing EarthFormer dataset adapter: {module_path}")
+    spec = importlib.util.spec_from_file_location(
+        "_earthformer_local_seviri_dataset",
+        module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import dataset adapter from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.SEVIRIImageSequenceDataset
+
+
+SEVIRIImageSequenceDataset = _load_project_seviri_dataset_class()
 
 
 def normalise_location(value: Any) -> str:
