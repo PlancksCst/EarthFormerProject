@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -65,21 +66,28 @@ class LocalCropDataset(Dataset):
         )
         self.station_mapping_rows = rows
         self.station_mapping = mapping_by_location(rows)
-        self.base_dataset = SEVIRIImageSequenceDataset(
-            dataset_root=str(dataset_root),
-            split=split,
-            sequence_length=sequence_length,
-            output_length=output_length,
-            image_size=image_size,
-            expected_channels=expected_channels,
-            normalize=normalize,
-            include_target=include_target,
-            metadata_filename=metadata_filename,
-            hourly_csv=str(hourly_csv) if hourly_csv is not None else None,
-            elevation_csv=str(elevation_csv) if elevation_csv is not None else None,
-            locations_csv=str(locations_csv) if locations_csv is not None else None,
-            include_auxiliary_features=include_auxiliary_features,
-        )
+        dataset_kwargs = {
+            "dataset_root": str(dataset_root),
+            "split": split,
+            "sequence_length": sequence_length,
+            "output_length": output_length,
+            "image_size": image_size,
+            "expected_channels": expected_channels,
+            "normalize": normalize,
+            "include_target": include_target,
+            "metadata_filename": metadata_filename,
+            "hourly_csv": str(hourly_csv) if hourly_csv is not None else None,
+            "elevation_csv": str(elevation_csv) if elevation_csv is not None else None,
+            "locations_csv": str(locations_csv) if locations_csv is not None else None,
+            "include_auxiliary_features": include_auxiliary_features,
+        }
+        supported = set(inspect.signature(SEVIRIImageSequenceDataset.__init__).parameters)
+        dataset_kwargs = {
+            key: value
+            for key, value in dataset_kwargs.items()
+            if key in supported
+        }
+        self.base_dataset = SEVIRIImageSequenceDataset(**dataset_kwargs)
 
     def __len__(self) -> int:
         return len(self.base_dataset)

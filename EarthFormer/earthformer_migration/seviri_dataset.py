@@ -201,11 +201,39 @@ class SEVIRIImageSequenceDataset(Dataset):
         root_joined = os.path.join(self.dataset_root, path)
         if os.path.exists(root_joined):
             return root_joined
-        basenames = {os.path.basename(path), PureWindowsPath(path).name}
+
+        candidates: list[str] = []
+        windows_path = PureWindowsPath(path)
+        windows_parts = [
+            part
+            for part in windows_path.parts
+            if part not in {windows_path.drive, windows_path.root, "\\"}
+        ]
+        # Metadata created on Windows may contain absolute paths such as
+        # C:\...\BEST_7\2019_05\2019_05.zarr.  In Colab, keep the meaningful
+        # dataset-relative suffix and resolve it below the active dataset root.
+        for index in range(len(windows_parts)):
+            suffix = os.path.join(*windows_parts[index:])
+            candidates.append(os.path.join(self.dataset_root, suffix))
+            candidates.append(os.path.join(os.path.dirname(self.dataset_root), suffix))
+
+        basenames = {os.path.basename(path), windows_path.name}
         for basename in basenames:
-            basename_joined = os.path.join(self.dataset_root, basename)
-            if os.path.exists(basename_joined):
-                return basename_joined
+            candidates.append(os.path.join(self.dataset_root, basename))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            if os.path.exists(candidate):
+                return candidate
+        if windows_path.drive or "\\" in path:
+            tried = "\n  ".join(seen)
+            raise FileNotFoundError(
+                "Could not remap Windows metadata path to this runtime. "
+                f"Original path: {path}\nDataset root: {self.dataset_root}\nTried:\n  {tried}"
+            )
         return path
 
     def _resolve_csv_path(
