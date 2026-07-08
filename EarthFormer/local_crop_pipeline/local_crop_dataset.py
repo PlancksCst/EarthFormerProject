@@ -62,6 +62,7 @@ class LocalCropDataset(Dataset):
         locations_csv: str | Path | None = None,
         include_target: bool = True,
         include_auxiliary_features: bool = False,
+        skip_bad_samples: bool = True,
         sequence_length: int = 13,
         output_length: int = 13,
         image_size: int = 200,
@@ -78,6 +79,7 @@ class LocalCropDataset(Dataset):
         self.local_crop_size = int(local_crop_size)
         self.crop_padding_mode = crop_padding_mode
         self.expected_image_size = int(image_size)
+        self.skip_bad_samples = bool(skip_bad_samples)
         rows = build_station_mapping(
             locations_csv=Path(locations_csv) if locations_csv is not None else None,
             bounds=crop_bounds or CropBounds(height=image_size, width=image_size),
@@ -160,11 +162,52 @@ class LocalCropDataset(Dataset):
             "local_crop_x1": x1,
         }
 
+    def _sample_metadata_for_log(self, index: int) -> str:
+        """Return compact sample metadata for skip/error logs."""
+        meta = getattr(self.base_dataset, "meta", None)
+        if meta is None:
+            return f"index={index}"
+        try:
+            row = meta.iloc[index]
+        except Exception:
+            return f"index={index}"
+        fields = ["sample_id", "location", "input_day", "target_day", "input_zarr"]
+        parts = [f"index={index}"]
+        for field in fields:
+            if field in row.index:
+                parts.append(f"{field}={row[field]}")
+        return ", ".join(parts)
+
+    def _load_base_item_with_skip(self, index: int) -> tuple[dict[str, Any], int, int | None]:
+        """Load a base item, optionally skipping samples that fail in the base dataset."""
+        dataset_length = len(self.base_dataset)
+        first_error: Exception | None = None
+        for offset in range(dataset_length):
+            candidate_index = (index + offset) % dataset_length
+            try:
+                item = dict(self.base_dataset[candidate_index])
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                print(
+                    "[local_crop_pipeline] Skipping bad base sample: "
+                    f"{self._sample_metadata_for_log(candidate_index)} | error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if not self.skip_bad_samples:
+                    raise
+                continue
+            skipped_from = index if candidate_index != index else None
+            return item, candidate_index, skipped_from
+        raise RuntimeError(
+            "All base dataset samples failed while trying to skip bad local-crop samples."
+        ) from first_error
+
     def __getitem__(self, index: int) -> dict[str, Any]:
-        item = dict(self.base_dataset[index])
+        item, loaded_index, skipped_from = self._load_base_item_with_skip(index)
         location_value = item.get("location")
         if location_value is None:
-            raise KeyError(f"Sample index {index} is missing location metadata.")
+            raise KeyError(f"Sample index {loaded_index} is missing location metadata.")
         location = normalise_location(location_value)
         mapping = self.station_mapping.get(location)
         if mapping is None:
@@ -179,6 +222,11 @@ class LocalCropDataset(Dataset):
         item["local_crop_center_y"] = torch.tensor(center_y, dtype=torch.long)
         item["local_crop_center_x"] = torch.tensor(center_x, dtype=torch.long)
         item["local_crop_size"] = torch.tensor(self.local_crop_size, dtype=torch.long)
+        item["local_crop_base_index"] = torch.tensor(loaded_index, dtype=torch.long)
+        item["local_crop_skipped_from_index"] = torch.tensor(
+            -1 if skipped_from is None else int(skipped_from),
+            dtype=torch.long,
+        )
         for key, value in crop_meta.items():
             item[key] = torch.tensor(value, dtype=torch.long)
         return item
