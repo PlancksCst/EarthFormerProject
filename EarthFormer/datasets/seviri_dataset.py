@@ -27,6 +27,8 @@ class SkipBadSampleDataset(Dataset):
     def __init__(self, base_dataset: Dataset, enabled: bool = True) -> None:
         self.base_dataset = base_dataset
         self.enabled = bool(enabled)
+        self.bad_indices: set[int] = set()
+        self.replacement_index: dict[int, int] = {}
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -49,22 +51,33 @@ class SkipBadSampleDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         dataset_length = len(self.base_dataset)
         first_error: Exception | None = None
+        cached_replacement = self.replacement_index.get(index)
+        if cached_replacement is not None:
+            try:
+                item = dict(self.base_dataset[cached_replacement])
+                item["base_index"] = torch.tensor(cached_replacement, dtype=torch.long)
+                item["skipped_from_index"] = torch.tensor(index, dtype=torch.long)
+                return item
+            except Exception as exc:
+                first_error = exc
+                self.bad_indices.add(cached_replacement)
+                self.replacement_index.pop(index, None)
+
         for offset in range(dataset_length):
             candidate_index = (index + offset) % dataset_length
+            if candidate_index in self.bad_indices:
+                continue
             try:
                 item = dict(self.base_dataset[candidate_index])
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-                print(
-                    "[earthformer_200px] Skipping bad base sample: "
-                    f"{self._sample_metadata_for_log(candidate_index)} | "
-                    f"error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+                self.bad_indices.add(candidate_index)
                 if not self.enabled:
                     raise
                 continue
+            if candidate_index != index:
+                self.replacement_index[index] = candidate_index
             item["base_index"] = torch.tensor(candidate_index, dtype=torch.long)
             item["skipped_from_index"] = torch.tensor(
                 -1 if candidate_index == index else index,

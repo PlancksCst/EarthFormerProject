@@ -44,6 +44,24 @@ from utils.metrics import forecast_metrics  # noqa: E402
 LOSS_CHOICES = ("masked_mse", "masked_huber", "masked_weighted_huber")
 
 
+def make_grad_scaler(device: torch.device, enabled: bool):
+    """Create an AMP grad scaler without deprecated CUDA-only calls."""
+    use_amp = bool(enabled and device.type == "cuda")
+    try:
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=use_amp)
+
+
+def amp_autocast(device: torch.device, enabled: bool):
+    """Return an autocast context without deprecated CUDA-only calls."""
+    use_amp = bool(enabled and device.type == "cuda")
+    try:
+        return torch.amp.autocast(device_type=device.type, enabled=use_amp)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.autocast(enabled=use_amp)
+
+
 def resolve_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -284,7 +302,7 @@ class LocalCropTrainer:
             dropout=args.dropout,
         ).to(self.device)
         self.optimizer = AdamW(self.model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=args.amp and self.device.type == "cuda")
+        self.scaler = make_grad_scaler(self.device, enabled=args.amp)
         self.history: list[dict[str, Any]] = []
         self.best_val = float("inf")
 
@@ -327,7 +345,7 @@ class LocalCropTrainer:
             if valid_count == 0:
                 continue
             self.optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=self.args.amp and self.device.type == "cuda"):
+            with amp_autocast(self.device, enabled=self.args.amp):
                 prediction = self.model(inputs, auxiliary_features=self._auxiliary(batch))
                 loss = compute_loss(
                     self.args.loss,

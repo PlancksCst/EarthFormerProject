@@ -80,6 +80,8 @@ class LocalCropDataset(Dataset):
         self.crop_padding_mode = crop_padding_mode
         self.expected_image_size = int(image_size)
         self.skip_bad_samples = bool(skip_bad_samples)
+        self.bad_indices: set[int] = set()
+        self.replacement_index: dict[int, int] = {}
         rows = build_station_mapping(
             locations_csv=Path(locations_csv) if locations_csv is not None else None,
             bounds=crop_bounds or CropBounds(height=image_size, width=image_size),
@@ -182,22 +184,31 @@ class LocalCropDataset(Dataset):
         """Load a base item, optionally skipping samples that fail in the base dataset."""
         dataset_length = len(self.base_dataset)
         first_error: Exception | None = None
+        cached_replacement = self.replacement_index.get(index)
+        if cached_replacement is not None:
+            try:
+                return dict(self.base_dataset[cached_replacement]), cached_replacement, index
+            except Exception as exc:
+                first_error = exc
+                self.bad_indices.add(cached_replacement)
+                self.replacement_index.pop(index, None)
+
         for offset in range(dataset_length):
             candidate_index = (index + offset) % dataset_length
+            if candidate_index in self.bad_indices:
+                continue
             try:
                 item = dict(self.base_dataset[candidate_index])
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-                print(
-                    "[local_crop_pipeline] Skipping bad base sample: "
-                    f"{self._sample_metadata_for_log(candidate_index)} | error={type(exc).__name__}: {exc}",
-                    flush=True,
-                )
+                self.bad_indices.add(candidate_index)
                 if not self.skip_bad_samples:
                     raise
                 continue
             skipped_from = index if candidate_index != index else None
+            if skipped_from is not None:
+                self.replacement_index[index] = candidate_index
             return item, candidate_index, skipped_from
         raise RuntimeError(
             "All base dataset samples failed while trying to skip bad local-crop samples."
