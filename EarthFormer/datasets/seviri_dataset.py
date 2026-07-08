@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import inspect
 import sys
 from pathlib import Path
+from typing import Any
 
-from torch.utils.data import DataLoader
+import torch
+from torch.utils.data import DataLoader, Dataset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PREP_MODELS_ROOT = PROJECT_ROOT.parent
@@ -18,9 +21,62 @@ from configs.config import TrainingConfig  # noqa: E402
 from earthformer_migration.seviri_dataset import SEVIRIImageSequenceDataset  # noqa: E402
 
 
-def build_dataset(config: TrainingConfig, split: str, include_target: bool) -> SEVIRIImageSequenceDataset:
+class SkipBadSampleDataset(Dataset):
+    """Skip and log base dataset samples that fail during frame loading."""
+
+    def __init__(self, base_dataset: Dataset, enabled: bool = True) -> None:
+        self.base_dataset = base_dataset
+        self.enabled = bool(enabled)
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def _sample_metadata_for_log(self, index: int) -> str:
+        meta = getattr(self.base_dataset, "meta", None)
+        if meta is None:
+            return f"index={index}"
+        try:
+            row = meta.iloc[index]
+        except Exception:
+            return f"index={index}"
+        fields = ["sample_id", "location", "input_day", "target_day", "input_zarr"]
+        parts = [f"index={index}"]
+        for field in fields:
+            if field in row.index:
+                parts.append(f"{field}={row[field]}")
+        return ", ".join(parts)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        dataset_length = len(self.base_dataset)
+        first_error: Exception | None = None
+        for offset in range(dataset_length):
+            candidate_index = (index + offset) % dataset_length
+            try:
+                item = dict(self.base_dataset[candidate_index])
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                print(
+                    "[earthformer_200px] Skipping bad base sample: "
+                    f"{self._sample_metadata_for_log(candidate_index)} | "
+                    f"error={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                if not self.enabled:
+                    raise
+                continue
+            item["base_index"] = torch.tensor(candidate_index, dtype=torch.long)
+            item["skipped_from_index"] = torch.tensor(
+                -1 if candidate_index == index else index,
+                dtype=torch.long,
+            )
+            return item
+        raise RuntimeError("All dataset samples failed while trying to skip bad samples.") from first_error
+
+
+def build_dataset(config: TrainingConfig, split: str, include_target: bool) -> Dataset:
     """Build a SEVIRI dataset split."""
-    return SEVIRIImageSequenceDataset(
+    dataset_kwargs = dict(
         dataset_root=str(config.dataset_root),
         split=split,
         sequence_length=config.input_length,
@@ -35,6 +91,13 @@ def build_dataset(config: TrainingConfig, split: str, include_target: bool) -> S
         elevation_csv=str(config.elevation_csv),
         locations_csv=str(config.locations_csv),
         include_auxiliary_features=config.use_auxiliary_features,
+    )
+    supported = set(inspect.signature(SEVIRIImageSequenceDataset.__init__).parameters)
+    dataset_kwargs = {key: value for key, value in dataset_kwargs.items() if key in supported}
+    base_dataset = SEVIRIImageSequenceDataset(**dataset_kwargs)
+    return SkipBadSampleDataset(
+        base_dataset,
+        enabled=bool(getattr(config, "skip_bad_samples", True)),
     )
 
 
